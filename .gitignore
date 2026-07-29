@@ -1,5 +1,5 @@
 # Specific to this project
-/assets/
+/assets
 !tools/assets/
 !tools/assets/render_object_foreground.py
 outputs/
