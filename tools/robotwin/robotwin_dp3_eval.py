@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+import imageio.v2 as imageio
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -15,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DP3_ROOT = REPO_ROOT / "third_party" / "RoboTwin" / "policy" / "DP3"
 DP3_DIFFUSION_ROOT = DP3_ROOT / "3D-Diffusion-Policy"
 ISAAC_ENV_ROOT = REPO_ROOT / "third_party" / "IsaacLab-Arena" / "isaaclab-arena-envs"
+ISAACLAB_ARENA_ROOT = REPO_ROOT / "third_party" / "IsaacLab-Arena"
 LEROBOT_SRC_ROOT = REPO_ROOT / "third_party" / "lerobot" / "src"
 TOOLS_EVAL_ROOT = REPO_ROOT / "tools" / "eval"
 
@@ -23,6 +25,7 @@ for path in (
     str(DP3_ROOT),
     str(DP3_ROOT / "scripts"),
     str(DP3_DIFFUSION_ROOT),
+    str(ISAACLAB_ARENA_ROOT),
     str(ISAAC_ENV_ROOT),
     str(LEROBOT_SRC_ROOT),
 ):
@@ -31,7 +34,8 @@ for path in (
 
 from automoma_dp3_utils import PointCloudConfig, rgbd_to_pointcloud
 from ee_pose_trace import EE_TRACE_COLUMNS, ee_trace_values, empty_ee_trace_values, make_ee_fk
-from lerobot.utils.io_utils import write_video
+from isaaclab_arena.scripts.automoma_replay_common import make_execution_disturbance
+from isaaclab_arena.utils.action_interpolation import interpolate_actions
 from train_dp3 import TrainDP3Workspace
 
 
@@ -62,6 +66,26 @@ ACTION_TRACE_CSV_COLUMNS = [
     "prepared_action_step_delta_abs",
     "sim_joint_step_delta_abs",
     *EE_TRACE_COLUMNS,
+]
+
+EPISODE_TRACE_CSV_COLUMNS = [
+    "episode_ix",
+    "step",
+    "terminated",
+    "truncated",
+    "openness",
+    "door_open",
+    "handle_distance",
+    "engaged",
+    "sim_base_x",
+    "sim_base_y",
+    "sim_base_yaw",
+    "action_base_x",
+    "action_base_y",
+    "action_base_yaw",
+    "raw_policy_base_x",
+    "raw_policy_base_y",
+    "raw_policy_base_yaw",
 ]
 
 SUMMIT_FRANKA_ACTION_JOINT_NAMES = (
@@ -261,6 +285,57 @@ class ActionTraceLogger:
         }
 
 
+class EpisodeTraceLogger:
+    def __init__(self, csv_path: Path, openable_object) -> None:
+        self.csv_path = csv_path
+        self.openable_object = openable_object
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.csv_path.open("w", newline="")
+        self._writer = csv.DictWriter(self._file, fieldnames=EPISODE_TRACE_CSV_COLUMNS)
+        self._writer.writeheader()
+
+    def close(self) -> None:
+        self._file.close()
+
+    def write_step(
+        self,
+        *,
+        env,
+        episode_ix: int,
+        step: int,
+        terminated: bool,
+        truncated: bool,
+        raw_policy_action: np.ndarray,
+        executed_action: np.ndarray,
+        sim_joint_pos_after: np.ndarray,
+        handle_distance_threshold: float,
+    ) -> None:
+        diagnostics = get_handle_diagnostics(env, self.openable_object)
+        openness = diagnostics["openness"]
+        handle_distance = diagnostics["handle_distance"]
+        self._writer.writerow(
+            {
+                "episode_ix": episode_ix,
+                "step": step,
+                "terminated": int(terminated),
+                "truncated": int(truncated),
+                "openness": maybe_scalar(openness),
+                "door_open": "" if np.isnan(openness) else int(openness >= 0.3),
+                "handle_distance": maybe_scalar(handle_distance),
+                "engaged": "" if np.isnan(handle_distance) else int(handle_distance <= handle_distance_threshold),
+                "sim_base_x": sim_joint_pos_after[0] if sim_joint_pos_after.shape[0] > 0 else "",
+                "sim_base_y": sim_joint_pos_after[1] if sim_joint_pos_after.shape[0] > 1 else "",
+                "sim_base_yaw": sim_joint_pos_after[2] if sim_joint_pos_after.shape[0] > 2 else "",
+                "action_base_x": executed_action[0] if executed_action.shape[0] > 0 else "",
+                "action_base_y": executed_action[1] if executed_action.shape[0] > 1 else "",
+                "action_base_yaw": executed_action[2] if executed_action.shape[0] > 2 else "",
+                "raw_policy_base_x": raw_policy_action[0] if raw_policy_action.shape[0] > 0 else "",
+                "raw_policy_base_y": raw_policy_action[1] if raw_policy_action.shape[0] > 1 else "",
+                "raw_policy_base_yaw": raw_policy_action[2] if raw_policy_action.shape[0] > 2 else "",
+            }
+        )
+
+
 class SimpleEnvConfig:
     def __init__(self, **kwargs):
         self.environment = kwargs.pop("environment")
@@ -297,6 +372,13 @@ class SimpleEnvConfig:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate RoboTwin DP3 on IsaacLab-Arena AutoMoMa env")
+    parser.add_argument("--policy_backend", choices=("dp3", "pi0"), default="dp3")
+    parser.add_argument("--pi0_host", default="127.0.0.1")
+    parser.add_argument("--pi0_port", type=int, default=8000)
+    parser.add_argument("--pi0_prompt", default="open the microwave door")
+    parser.add_argument("--pi0_image_key", default="ego_topdown_rgb")
+    parser.add_argument("--pi0_wrist_image_key", default="ego_wrist_rgb")
+    parser.add_argument("--pi0_right_image_key", default="fix_local_rgb")
     parser.add_argument("--task_name", required=True)
     parser.add_argument("--task_config", required=True)
     parser.add_argument("--expert_data_num", type=int, required=True)
@@ -320,7 +402,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traj_file", type=str, default=None)
     parser.add_argument("--traj_seed", type=int, default=42)
     parser.add_argument("--traj_selection_mode", choices=("random", "sequential"), default="random")
+    parser.add_argument("--episode_indices", type=str, default=None)
     parser.add_argument("--env.episode_length", "--max_steps", dest="max_steps", type=int, default=300)
+    parser.add_argument("--interpolated", type=int, default=1)
+    parser.add_argument("--interpolation_type", default="linear")
+    parser.add_argument("--actions_per_inference", type=int, default=None)
+    parser.add_argument("--policy_action_dim", type=int, default=12)
+    parser.add_argument("--policy_horizon", type=int, default=None)
+    parser.add_argument("--policy_n_obs_steps", type=int, default=None)
+    parser.add_argument("--policy_n_action_steps", type=int, default=None)
+    parser.add_argument("--decimation", type=int, default=None)
+    parser.add_argument("--sim_dt", type=float, default=None)
     parser.add_argument("--headless", type=str2bool, default=True)
     parser.add_argument("--env.headless", dest="headless", type=str2bool)
     parser.add_argument("--max_episodes_rendered", type=int, default=10)
@@ -342,9 +434,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_record_handle_diagnostics", type=str2bool, default=False)
     parser.add_argument("--debug_action_trace", type=str2bool, default=False)
     parser.add_argument("--action_trace_csv", type=str, default=None)
+    parser.add_argument("--debug_episode_trace_csv", type=str, default=None)
     parser.add_argument("--handle_distance_threshold", type=float, default=0.1)
     parser.add_argument("--robot_object_static_friction", type=float, default=None)
     parser.add_argument("--robot_object_dynamic_friction", type=float, default=None)
+    parser.add_argument("--slam_bias_x", type=float, default=0.0)
+    parser.add_argument("--slam_bias_y", type=float, default=0.0)
+    parser.add_argument("--slam_bias_yaw", type=float, default=0.0)
+    parser.add_argument("--slam_bias_ramp_seconds", type=float, default=0.0)
+    parser.add_argument("--slam_drift_std_xy", type=float, default=0.0)
+    parser.add_argument("--slam_drift_std_yaw", type=float, default=0.0)
+    parser.add_argument("--slam_drift_alpha", type=float, default=0.995)
+    parser.add_argument("--base_wobble_y_amp", type=float, default=0.0)
+    parser.add_argument("--base_wobble_yaw_amp", type=float, default=0.0)
+    parser.add_argument("--base_wobble_freq_hz", type=float, default=5.0)
+    parser.add_argument("--disturbance_seed", type=int, default=0)
+    parser.add_argument("--disturbance_reference_hz", type=float, default=50.0)
     return parser.parse_args()
 
 
@@ -358,8 +463,22 @@ def make_cfg(args: argparse.Namespace):
     cfg.setting = args.ckpt_setting
     cfg.raw_task_name = args.task_name
     cfg.policy.use_pc_color = args.use_rgb
+    if args.policy_horizon is not None:
+        cfg.horizon = args.policy_horizon
+        cfg.policy.horizon = args.policy_horizon
+    if args.policy_n_obs_steps is not None:
+        cfg.n_obs_steps = args.policy_n_obs_steps
+        cfg.dataset_obs_steps = args.policy_n_obs_steps
+        cfg.policy.n_obs_steps = args.policy_n_obs_steps
+        cfg.task.env_runner.n_obs_steps = args.policy_n_obs_steps
+        cfg.task.dataset.pad_before = args.policy_n_obs_steps - 1
+    if args.policy_n_action_steps is not None:
+        cfg.n_action_steps = args.policy_n_action_steps
+        cfg.policy.n_action_steps = args.policy_n_action_steps
+        cfg.task.env_runner.n_action_steps = args.policy_n_action_steps
+        cfg.task.dataset.pad_after = args.policy_n_action_steps - 1
     cfg.task.shape_meta.obs.agent_pos.shape = [12]
-    cfg.task.shape_meta.action.shape = [12]
+    cfg.task.shape_meta.action.shape = [args.policy_action_dim]
     OmegaConf.set_struct(cfg, True)
     return cfg
 
@@ -376,6 +495,20 @@ def load_policy(cfg, args: argparse.Namespace):
     }
     policy, env_runner = workspace.get_policy_and_runner(cfg, usr_args)
     return policy, env_runner
+
+
+def load_pi0_policy(args: argparse.Namespace):
+    try:
+        from openpi_client.websocket_client_policy import WebsocketClientPolicy
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Pi0 backend requires openpi-client in the active environment."
+        ) from exc
+
+    policy = WebsocketClientPolicy(args.pi0_host, args.pi0_port)
+    metadata = policy.get_server_metadata()
+    print(f"[pi0] connected to {args.pi0_host}:{args.pi0_port} metadata={metadata}", flush=True)
+    return policy
 
 
 def parse_env_identifiers(task_name: str, task_config: str) -> tuple[str, str]:
@@ -398,7 +531,7 @@ def resolve_set_object_open_target(args: argparse.Namespace) -> tuple[float, str
 
 def build_env(args: argparse.Namespace):
     object_name, scene_name = parse_env_identifiers(args.task_name, args.task_config)
-    traj_file = Path(args.traj_file) if args.traj_file else REPO_ROOT / "data" / "trajs" / "summit_franka" / object_name / scene_name / "test" / "traj_data_test.pt"
+    traj_file = str(Path(args.traj_file)) if args.traj_file else None
     cfg = SimpleEnvConfig(
         environment="summit_franka_open_door_eval",
         headless=args.headless,
@@ -414,9 +547,13 @@ def build_env(args: argparse.Namespace):
         scene_name=scene_name,
         object_center=True,
         mobile_base_relative=args.mobile_base_relative,
-        traj_file=str(traj_file),
+        traj_file=traj_file,
         traj_seed=args.traj_seed,
         traj_selection_mode=args.traj_selection_mode,
+        interpolated=args.interpolated,
+        interpolation_type=args.interpolation_type,
+        decimation=args.decimation,
+        sim_dt=args.sim_dt,
         openness_threshold=0.3,
         handle_distance_threshold=args.handle_distance_threshold,
         proximity_threshold=0.12,
@@ -452,12 +589,48 @@ def extract_joint_pos(obs: dict) -> np.ndarray:
     return joint_pos[0].astype(np.float32) if joint_pos.ndim == 2 else joint_pos.astype(np.float32)
 
 
+def extract_rgb_image(obs: dict, key: str) -> np.ndarray:
+    image = obs["camera_obs"][key]
+    if isinstance(image, torch.Tensor):
+        image = image.detach().cpu().numpy()
+    image = np.asarray(image)
+    if image.ndim == 4:
+        image = image[0]
+    if image.ndim == 3 and image.shape[0] in {3, 4} and image.shape[-1] not in {3, 4}:
+        image = np.moveaxis(image, 0, -1)
+    if image.shape[-1] == 4:
+        image = image[..., :3]
+    if image.dtype != np.uint8:
+        if np.issubdtype(image.dtype, np.floating) and float(np.nanmax(image)) <= 1.0:
+            image = image * 255.0
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return image
+
+
+def make_pi0_observation(obs: dict, args: argparse.Namespace) -> dict:
+    return {
+        "observation/image": extract_rgb_image(obs, args.pi0_image_key),
+        "observation/wrist_image": extract_rgb_image(obs, args.pi0_wrist_image_key),
+        "observation/right_image": extract_rgb_image(obs, args.pi0_right_image_key),
+        "observation/state": extract_joint_pos(obs).astype(np.float32),
+        "prompt": args.pi0_prompt,
+    }
+
+
 def tensor_action_to_numpy(action: torch.Tensor) -> np.ndarray:
     action_np = action.detach().cpu().numpy()
     return action_np[0].astype(np.float32) if action_np.ndim == 2 else action_np.astype(np.float32)
 
 
+def expand_policy_action_for_env(action: np.ndarray) -> np.ndarray:
+    action = np.asarray(action, dtype=np.float32).reshape(-1)
+    if action.shape[0] == 11:
+        return np.concatenate([action[:10], action[10:11], action[10:11]]).astype(np.float32)
+    return action
+
+
 def prepare_env_action(env, action: np.ndarray) -> tuple[torch.Tensor | np.ndarray, np.ndarray]:
+    action = expand_policy_action_for_env(action)
     batched_action = action[None, :]
     if hasattr(env, "prepare_action"):
         prepared_action = env.prepare_action(batched_action)
@@ -477,6 +650,55 @@ def prepared_action_like(reference_action, action: np.ndarray) -> torch.Tensor |
     return batched_action
 
 
+def apply_execution_disturbance(prepared_action, disturbance, step: int):
+    if disturbance is None:
+        return prepared_action, tensor_action_to_numpy(prepared_action) if isinstance(prepared_action, torch.Tensor) else prepared_action[0]
+    if isinstance(prepared_action, torch.Tensor):
+        disturbed = disturbance.apply(prepared_action, step)
+        return disturbed, tensor_action_to_numpy(disturbed)
+    disturbed = disturbance.apply(torch.as_tensor(prepared_action, dtype=torch.float32), step)
+    return disturbed.numpy(), tensor_action_to_numpy(disturbed)
+
+
+def get_env_step_dt(env, fallback: float = 0.02) -> float:
+    raw_env = getattr(env, "_env", None)
+    return float(getattr(raw_env, "step_dt", fallback) or fallback)
+
+
+def resolve_openable_object(env):
+    raw_env = getattr(env, "_env", None)
+    arena_env = getattr(getattr(raw_env, "cfg", None), "isaaclab_arena_env", None)
+    return getattr(getattr(arena_env, "task", None), "openable_object", None)
+
+
+def _scalar_from_tensor(value, default: float = np.nan) -> float:
+    if value is None:
+        return default
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return float(value.reshape(-1)[0]) if value.size else default
+    return float(value)
+
+
+def get_handle_diagnostics(env, openable_object) -> dict[str, float]:
+    if openable_object is None:
+        return {"openness": np.nan, "handle_distance": np.nan}
+    raw_env = getattr(env, "_env", None)
+    try:
+        from isaaclab_arena.metrics.handle_proximity_rate import get_cached_handle_proximity_diagnostics
+
+        diagnostics = get_cached_handle_proximity_diagnostics(raw_env, openable_object)
+    except Exception:
+        diagnostics = None
+    if diagnostics is None:
+        return {"openness": np.nan, "handle_distance": np.nan}
+    return {
+        "openness": _scalar_from_tensor(diagnostics.get("openness")),
+        "handle_distance": _scalar_from_tensor(diagnostics.get("handle_distance")),
+    }
+
+
 def slow_set_robot_action(current_joint_pos: np.ndarray, target_action: np.ndarray, alpha: float) -> np.ndarray:
     if alpha >= 1.0:
         return target_action.copy()
@@ -485,6 +707,28 @@ def slow_set_robot_action(current_joint_pos: np.ndarray, target_action: np.ndarr
     width = min(SET_ROBOT_FILTERED_JOINT_COUNT, int(current_joint_pos.shape[0]), int(target_action.shape[0]))
     slowed_action[:width] = current_joint_pos[:width] + alpha * (target_action[:width] - current_joint_pos[:width])
     return slowed_action
+
+
+def interpolate_prepared_actions_from_current(
+    current_joint_pos: np.ndarray,
+    target_action: np.ndarray,
+    interpolation_factor: int,
+    interpolation_type: str,
+) -> list[np.ndarray]:
+    if interpolation_factor <= 1 or interpolation_type == "none":
+        return [target_action.astype(np.float32, copy=True)]
+
+    start = target_action.astype(np.float32, copy=True)
+    width = min(start.shape[0], current_joint_pos.shape[0])
+    start[:width] = current_joint_pos[:width]
+    expanded = interpolate_actions(
+        torch.as_tensor(start, dtype=torch.float32),
+        torch.as_tensor(target_action, dtype=torch.float32),
+        interpolation_factor,
+        interpolation_type,
+        include_start=False,
+    )
+    return [expanded[i].cpu().numpy().astype(np.float32) for i in range(expanded.shape[0])]
 
 
 def set_robot_joint_state(env, action: np.ndarray) -> None:
@@ -741,6 +985,32 @@ def get_success_metrics(final_info: dict) -> dict[str, float | bool]:
     }
 
 
+def snapshot_success_metrics(
+    env,
+    openness_threshold: float,
+    handle_distance_threshold: float,
+) -> dict[str, float | bool] | None:
+    summaries = getattr(env, "_episode_summaries", None)
+    if not summaries:
+        return None
+    summary = summaries[0]
+    final_openness = summary.get("final_door_openness")
+    final_handle_distance = summary.get("final_handle_distance")
+    if final_openness is None or final_handle_distance is None:
+        return None
+    final_openness = float(final_openness)
+    final_handle_distance = float(final_handle_distance)
+    final_door_open = final_openness >= openness_threshold
+    final_engaged = final_handle_distance <= handle_distance_threshold
+    return {
+        "success": bool(final_door_open and final_engaged),
+        "final_door_openness": final_openness,
+        "final_door_open": final_door_open,
+        "final_engaged": final_engaged,
+        "final_handle_distance": final_handle_distance,
+    }
+
+
 def maybe_scalar(value: object) -> object:
     if value is None:
         return ""
@@ -762,10 +1032,24 @@ def render_frame(env) -> np.ndarray | None:
     return np.asarray(frame)
 
 
+def write_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
+    imageio.mimsave(path, frames, fps=fps)
+
+
 def main() -> None:
     args = parse_args()
     if args.max_steps < 1:
         raise ValueError("--env.episode_length/--max_steps must be >= 1.")
+    if args.interpolated < 1:
+        raise ValueError("--interpolated must be >= 1.")
+    if args.decimation is not None and args.decimation < 1:
+        raise ValueError("--decimation must be >= 1.")
+    if args.sim_dt is not None and args.sim_dt <= 0.0:
+        raise ValueError("--sim_dt must be > 0.")
+    if args.disturbance_reference_hz <= 0.0:
+        raise ValueError("--disturbance_reference_hz must be > 0.")
+    if args.actions_per_inference is not None and args.actions_per_inference < 1:
+        raise ValueError("--actions_per_inference must be >= 1.")
     if args.set_sim_steps_per_action < 1:
         raise ValueError("--set_sim_steps_per_action must be >= 1.")
     if not 0.0 < args.set_robot_action_alpha <= 1.0:
@@ -781,10 +1065,26 @@ def main() -> None:
     if args.set_object_open_effort < 0.0:
         raise ValueError("--set_object_open_effort must be >= 0.")
     torch.cuda.set_device(int(args.gpu_id))
+    openness_threshold = 0.3
+    handle_distance_threshold = float(args.handle_distance_threshold)
 
-    cfg = make_cfg(args)
-    policy, env_runner = load_policy(cfg, args)
+    if args.policy_backend == "dp3":
+        cfg = make_cfg(args)
+        policy, env_runner = load_policy(cfg, args)
+    else:
+        policy = load_pi0_policy(args)
+        env_runner = None
     env = build_env(args)
+    step_dt = get_env_step_dt(env)
+    disturbance = make_execution_disturbance(args, step_dt)
+    if disturbance is not None:
+        print(
+            "[disturbance] enabled "
+            f"dt={step_dt} slam_bias=({args.slam_bias_x}, {args.slam_bias_y}, {args.slam_bias_yaw}) "
+            f"drift_std=({args.slam_drift_std_xy}, {args.slam_drift_std_yaw}) "
+            f"wobble=({args.base_wobble_y_amp}, {args.base_wobble_yaw_amp}) seed={args.disturbance_seed}",
+            flush=True,
+        )
     set_object_open_target, set_object_open_target_source = resolve_set_object_open_target(args)
     set_object_drive: dict[str, object] = {}
     set_object_velocity_hook: dict[str, object] = {}
@@ -821,6 +1121,11 @@ def main() -> None:
         if args.debug_action_trace
         else None
     )
+    episode_trace_logger = (
+        EpisodeTraceLogger(Path(args.debug_episode_trace_csv), resolve_openable_object(env))
+        if args.debug_episode_trace_csv
+        else None
+    )
 
     pc_cfg = PointCloudConfig(
         n_points=args.n_points,
@@ -838,16 +1143,27 @@ def main() -> None:
     all_episode_metrics: list[dict[str, object]] = []
     all_successes: list[bool] = []
     all_seeds: list[int] = []
+    all_episode_indices: list[int] = []
     video_paths: list[str] = []
+    episode_indices = (
+        [int(item) for item in args.episode_indices.split(",") if item.strip()]
+        if args.episode_indices
+        else list(range(args.n_episodes))
+    )
 
     try:
-        for episode_ix in range(args.n_episodes):
+        for render_ix, episode_ix in enumerate(episode_indices):
             episode_seed = args.seed + episode_ix
+            if hasattr(env, "_traj_next_episode") and args.traj_selection_mode == "sequential":
+                env._traj_next_episode = episode_ix
             obs, _info = env.reset(seed=episode_seed)
-            env_runner.reset_obs()
+            if env_runner is not None:
+                env_runner.reset_obs()
+            if disturbance is not None:
+                disturbance.begin_episode(episode_ix)
 
             frames: list[np.ndarray] = []
-            if episode_ix < args.max_episodes_rendered:
+            if render_ix < args.max_episodes_rendered:
                 frame = render_frame(env)
                 if frame is not None:
                     frames.append(frame)
@@ -856,77 +1172,120 @@ def main() -> None:
             final_info = {"is_success": np.array([False])}
             steps = 0
             while not done and steps < args.max_steps:
-                point_cloud = extract_point_cloud(obs, args.camera_view, pc_cfg, rng)
-                joint_pos = extract_joint_pos(obs)
-                dp3_obs = {
-                    "point_cloud": point_cloud.astype(np.float32),
-                    "agent_pos": joint_pos.astype(np.float32),
-                }
-
-                if len(env_runner.obs) == 0:
-                    env_runner.update_obs(dp3_obs)
-                    actions = env_runner.get_action(policy)
-                else:
-                    actions = env_runner.get_action(policy, dp3_obs)
-                for action in actions:
-                    raw_policy_action = np.asarray(action, dtype=np.float32).reshape(-1)
-                    target_prepared_action, target_prepared_action_np = prepare_env_action(env, raw_policy_action)
-                    sim_steps_per_action = args.set_sim_steps_per_action if args.action_execution == "set" else 1
-                    for _ in range(sim_steps_per_action):
-                        sim_joint_pos_before = extract_joint_pos(obs)
-                        if args.action_execution == "set":
-                            executed_action_np = slow_set_robot_action(
-                                sim_joint_pos_before,
-                                target_prepared_action_np,
-                                args.set_robot_action_alpha,
-                            )
-                            executed_prepared_action = prepared_action_like(target_prepared_action, executed_action_np)
-                            set_robot_joint_state(env, executed_action_np)
-                            apply_object_open_target(
-                                env,
-                                target=set_object_open_target,
-                                velocity=args.set_object_open_velocity,
-                                effort=args.set_object_open_effort,
-                            )
-                        else:
-                            executed_action_np = target_prepared_action_np
-                            executed_prepared_action = target_prepared_action
-                        obs, _reward, terminated, truncated, info = step_prepared_env_action(env, executed_prepared_action)
-                        steps += 1
-                        done = bool(terminated[0] or truncated[0])
-                        final_info = info.get("final_info", final_info)
-                        sim_joint_pos_after = extract_joint_pos(obs)
-                        if action_trace_logger is not None:
-                            action_trace_logger.write_step(
-                                episode_ix=episode_ix,
-                                policy_step_ix=steps - 1,
-                                terminated=bool(terminated[0]),
-                                truncated=bool(truncated[0]),
-                                raw_policy_action=raw_policy_action,
-                                prepared_action_abs=executed_action_np,
-                                sim_joint_pos_before=sim_joint_pos_before,
-                                sim_joint_pos_after=sim_joint_pos_after,
-                            )
-                        if episode_ix < args.max_episodes_rendered:
-                            frame = render_frame(env)
-                            if frame is not None:
-                                frames.append(frame)
-                        if done or steps >= args.max_steps:
-                            break
+                if args.policy_backend == "dp3":
                     point_cloud = extract_point_cloud(obs, args.camera_view, pc_cfg, rng)
                     joint_pos = extract_joint_pos(obs)
-                    env_runner.update_obs(
-                        {
-                            "point_cloud": point_cloud.astype(np.float32),
-                            "agent_pos": joint_pos.astype(np.float32),
-                        }
+                    dp3_obs = {
+                        "point_cloud": point_cloud.astype(np.float32),
+                        "agent_pos": joint_pos.astype(np.float32),
+                    }
+
+                    if len(env_runner.obs) == 0:
+                        env_runner.update_obs(dp3_obs)
+                        actions = env_runner.get_action(policy)
+                    else:
+                        actions = env_runner.get_action(policy, dp3_obs)
+                else:
+                    actions = policy.infer(make_pi0_observation(obs, args))["actions"]
+                    actions = np.asarray(actions, dtype=np.float32)
+                    if actions.ndim == 3:
+                        actions = actions[0]
+                selected_actions = actions[:args.actions_per_inference] if args.actions_per_inference else actions
+                for action in selected_actions:
+                    raw_policy_action = np.asarray(action, dtype=np.float32).reshape(-1)
+                    target_prepared_action, target_prepared_action_np = prepare_env_action(env, raw_policy_action)
+                    execution_targets_np = interpolate_prepared_actions_from_current(
+                        extract_joint_pos(obs),
+                        target_prepared_action_np,
+                        args.interpolated,
+                        args.interpolation_type,
                     )
+                    repeat_count = (
+                        args.set_sim_steps_per_action
+                        if args.action_execution == "set" and args.interpolated <= 1
+                        else 1
+                    )
+                    for target_action_np in execution_targets_np:
+                        for _ in range(repeat_count):
+                            sim_joint_pos_before = extract_joint_pos(obs)
+                            if args.action_execution == "set":
+                                executed_action_np = slow_set_robot_action(
+                                    sim_joint_pos_before,
+                                    target_action_np,
+                                    args.set_robot_action_alpha,
+                                )
+                                executed_prepared_action = prepared_action_like(target_prepared_action, executed_action_np)
+                                set_robot_joint_state(env, executed_action_np)
+                                apply_object_open_target(
+                                    env,
+                                    target=set_object_open_target,
+                                    velocity=args.set_object_open_velocity,
+                                    effort=args.set_object_open_effort,
+                                )
+                            else:
+                                executed_action_np = target_action_np
+                                executed_prepared_action = prepared_action_like(target_prepared_action, executed_action_np)
+                                executed_prepared_action, executed_action_np = apply_execution_disturbance(
+                                    executed_prepared_action,
+                                    disturbance,
+                                    steps,
+                                )
+                            obs, _reward, terminated, truncated, info = step_prepared_env_action(env, executed_prepared_action)
+                            steps += 1
+                            done = bool(terminated[0] or truncated[0])
+                            final_info = info.get("final_info", final_info)
+                            sim_joint_pos_after = extract_joint_pos(obs)
+                            if action_trace_logger is not None:
+                                action_trace_logger.write_step(
+                                    episode_ix=episode_ix,
+                                    policy_step_ix=steps - 1,
+                                    terminated=bool(terminated[0]),
+                                    truncated=bool(truncated[0]),
+                                    raw_policy_action=raw_policy_action,
+                                    prepared_action_abs=executed_action_np,
+                                    sim_joint_pos_before=sim_joint_pos_before,
+                                    sim_joint_pos_after=sim_joint_pos_after,
+                                )
+                            if episode_trace_logger is not None:
+                                episode_trace_logger.write_step(
+                                    env=env,
+                                    episode_ix=episode_ix,
+                                    step=steps - 1,
+                                    terminated=bool(terminated[0]),
+                                    truncated=bool(truncated[0]),
+                                    raw_policy_action=raw_policy_action,
+                                    executed_action=executed_action_np,
+                                    sim_joint_pos_after=sim_joint_pos_after,
+                                    handle_distance_threshold=handle_distance_threshold,
+                                )
+                            if render_ix < args.max_episodes_rendered:
+                                frame = render_frame(env)
+                                if frame is not None:
+                                    frames.append(frame)
+                            if done or steps >= args.max_steps:
+                                break
+                        if done or steps >= args.max_steps:
+                            break
                     if done or steps >= args.max_steps:
                         break
+                    if args.policy_backend == "dp3":
+                        point_cloud = extract_point_cloud(obs, args.camera_view, pc_cfg, rng)
+                        joint_pos = extract_joint_pos(obs)
+                        env_runner.update_obs(
+                            {
+                                "point_cloud": point_cloud.astype(np.float32),
+                                "agent_pos": joint_pos.astype(np.float32),
+                            }
+                        )
 
-            metrics = get_success_metrics(final_info)
+            metrics = (
+                snapshot_success_metrics(env, openness_threshold, handle_distance_threshold)
+                or get_success_metrics(final_info)
+            )
+            if np.isnan(float(metrics["final_door_openness"])):
+                metrics = get_success_metrics(final_info)
             video_path = ""
-            if episode_ix < args.max_episodes_rendered and frames:
+            if render_ix < args.max_episodes_rendered and frames:
                 videos_dir.mkdir(parents=True, exist_ok=True)
                 video_file = videos_dir / f"eval_episode_{episode_ix}.mp4"
                 fps = int(getattr(env, "metadata", {}).get("render_fps", 30))
@@ -947,6 +1306,8 @@ def main() -> None:
             }
             append_per_episode_csv_row(csv_path, row)
             print(row, flush=True)
+            if disturbance is not None:
+                disturbance.end_episode()
 
             all_episode_metrics.append({
                 "final_door_openness": maybe_scalar(metrics["final_door_openness"]),
@@ -954,18 +1315,19 @@ def main() -> None:
             })
             all_successes.append(bool(metrics["success"]))
             all_seeds.append(episode_seed)
+            all_episode_indices.append(episode_ix)
 
         elapsed = time.time() - start_time
         eval_info = {
             "per_episode": [
                 {
-                    "episode_ix": i,
+                    "episode_ix": episode_ix,
                     **episode_metrics,
                     "success": success,
                     "seed": seed,
                 }
-                for i, (episode_metrics, success, seed) in enumerate(
-                    zip(all_episode_metrics, all_successes, all_seeds, strict=True)
+                for episode_ix, episode_metrics, success, seed in zip(
+                    all_episode_indices, all_episode_metrics, all_successes, all_seeds, strict=True
                 )
             ],
             "aggregated": {
@@ -996,6 +1358,16 @@ def main() -> None:
             "cuakr_set_sim_steps_reference": CUAKR_SET_SIM_STEPS_PER_ACTION,
             "set_robot_action_alpha": args.set_robot_action_alpha,
             "set_robot_filtered_joint_count": SET_ROBOT_FILTERED_JOINT_COUNT,
+            "interpolated": args.interpolated,
+            "interpolation_type": args.interpolation_type,
+            "actions_per_inference": args.actions_per_inference,
+            "decimation": args.decimation,
+            "sim_dt": args.sim_dt,
+            "env_step_dt": (
+                float(args.sim_dt) * int(args.decimation)
+                if args.sim_dt is not None and args.decimation is not None
+                else None
+            ),
             "max_steps": args.max_steps,
             "mobile_base_relative": bool(args.mobile_base_relative),
             "traj_file": str(Path(args.traj_file).resolve()) if args.traj_file else "",
@@ -1009,6 +1381,23 @@ def main() -> None:
             "ckpt_setting": args.ckpt_setting,
             "debug_action_trace": bool(args.debug_action_trace),
             "action_trace_csv": str(action_trace_path) if args.debug_action_trace else "",
+            "debug_episode_trace_csv": str(Path(args.debug_episode_trace_csv)) if args.debug_episode_trace_csv else "",
+            "disturbance": {
+                "enabled": disturbance is not None,
+                "slam_bias_x": args.slam_bias_x,
+                "slam_bias_y": args.slam_bias_y,
+                "slam_bias_yaw": args.slam_bias_yaw,
+                "slam_bias_ramp_seconds": args.slam_bias_ramp_seconds,
+                "slam_drift_std_xy": args.slam_drift_std_xy,
+                "slam_drift_std_yaw": args.slam_drift_std_yaw,
+                "slam_drift_alpha": args.slam_drift_alpha,
+                "base_wobble_y_amp": args.base_wobble_y_amp,
+                "base_wobble_yaw_amp": args.base_wobble_yaw_amp,
+                "base_wobble_freq_hz": args.base_wobble_freq_hz,
+                "disturbance_seed": args.disturbance_seed,
+                "disturbance_reference_hz": args.disturbance_reference_hz,
+                "step_dt": step_dt,
+            },
         }
         if action_trace_logger is not None:
             eval_info["action_trace_summary"] = action_trace_logger.summary()
@@ -1020,6 +1409,8 @@ def main() -> None:
     finally:
         if action_trace_logger is not None:
             action_trace_logger.close()
+        if episode_trace_logger is not None:
+            episode_trace_logger.close()
         env.close()
 
 
