@@ -4,6 +4,12 @@ This branch is the external-first comparison. It starts from upstream AutoMoMa
 and uses an AutoMoMa-compatible Franka execution stack. It does not import the
 G2 implementation or its controllers.
 
+The branch may read a previously generated RealAppliance contact hypothesis as
+an explicitly labelled migration input while the native hypothesis adapter is
+being implemented. Such a run is not evidence of AutoMoMa-native candidate
+generation, and its video/result must never be mixed with G2 artifacts or
+reported as an AutoMoMa success.
+
 ## Scope
 
 The first gate is handled `open` only. The scene may be empty and the appliance
@@ -48,3 +54,12 @@ the first executable uses the installed Isaac Sim runtime, Isaac Sim's Franka
 asset, and RealAppliance USDs. Asset resolution is isolated behind an adapter so
 the missing upstream Summit USD can replace it later without changing success
 semantics.
+
+## Artifact isolation
+
+- AutoMoMa-branch runs use an `automoma_native` root only.
+- Compatibility-executor failures and native-planner results use different
+  subdirectories.
+- G2 videos, plans, logs, and success counts are excluded from this branch.
+- A success directory is created only after the strict physical and provenance
+  audits pass; partial transfers are labelled and quarantined.
