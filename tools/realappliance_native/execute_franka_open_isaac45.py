@@ -54,6 +54,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--finger-effort-multiplier", type=float, default=2.0)
     result.add_argument("--render-stride", type=int, default=3)
     result.add_argument("--camera-distance-multiplier", type=float, default=2.0)
+    result.add_argument("--passive-baseline-steps", type=int, default=120)
+    result.add_argument("--max-passive-drift-fraction", type=float, default=0.025)
     result.add_argument(
         "--headless", action=argparse.BooleanOptionalAction, default=True
     )
@@ -76,7 +78,6 @@ SIMULATION_APP = SimulationApp(
 )
 
 import cv2  # noqa: E402
-import imageio.v2 as imageio  # noqa: E402
 from isaacsim.core.api import World  # noqa: E402
 from isaacsim.core.api.sensors import RigidContactView  # noqa: E402
 from isaacsim.core.prims import Articulation, SingleXFormPrim  # noqa: E402
@@ -225,6 +226,22 @@ def compose_frame(
     return frame
 
 
+def write_video(path: Path, frames: list[np.ndarray], fps: float = 30.0) -> None:
+    if not frames:
+        raise RuntimeError("cannot write an empty video")
+    height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"OpenCV could not open video writer for {path}")
+    try:
+        for frame in frames:
+            writer.write(frame)
+    finally:
+        writer.release()
+
+
 def main() -> None:
     values = parse_inputs()
     world = World(
@@ -361,6 +378,31 @@ def main() -> None:
         array = np.asarray(matrix, dtype=np.float64)
         return 0.0 if not array.size else float(np.max(np.linalg.norm(array, axis=-1)))
 
+    def record_step(phase: str, render: bool) -> None:
+        nonlocal step_count
+        measured_joint, progress = measured_progress()
+        force = target_contact_force()
+        trace.append(
+            {
+                "step": step_count,
+                "phase": phase,
+                "target_joint_position": measured_joint,
+                "range_fraction": progress,
+                "target_contact_force_n": force,
+                "object_target_was_written": False,
+                "attachment_active": False,
+            }
+        )
+        if render:
+            frames.append(
+                compose_frame(
+                    {name: rgba_rgb(camera) for name, camera in cameras.items()},
+                    phase,
+                    progress,
+                )
+            )
+        step_count += 1
+
     def step_pose(
         phase: str,
         position: np.ndarray,
@@ -376,32 +418,16 @@ def main() -> None:
                 franka.gripper.apply_action(
                     ArticulationAction(joint_positions=[gripper_width, gripper_width])
                 )
-            world.step(render=(step_count % int(ARGS.render_stride) == 0))
-            measured_joint, progress = measured_progress()
-            force = target_contact_force()
-            trace.append(
-                {
-                    "step": step_count,
-                    "phase": phase,
-                    "target_joint_position": measured_joint,
-                    "range_fraction": progress,
-                    "target_contact_force_n": force,
-                    "object_target_was_written": False,
-                    "attachment_active": False,
-                }
-            )
-            if step_count % int(ARGS.render_stride) == 0:
-                frames.append(
-                    compose_frame(
-                        {name: rgba_rgb(camera) for name, camera in cameras.items()},
-                        phase,
-                        progress,
-                    )
-                )
-            step_count += 1
+            render = step_count % int(ARGS.render_stride) == 0
+            world.step(render=render)
+            record_step(phase, render)
 
-    for _ in range(60):
-        world.step(render=True)
+    for _ in range(int(ARGS.passive_baseline_steps)):
+        render = step_count % int(ARGS.render_stride) == 0
+        world.step(render=render)
+        record_step("PASSIVE_BASELINE", render)
+    _, passive_baseline_drift = measured_progress()
+
     step_pose("PRECONTACT", precontact_world, orientation, 300, 0.04)
     step_pose("CONTACT", contact_world, orientation, 180, 0.04)
     step_pose("CLOSE", contact_world, orientation, 180, 0.0)
@@ -451,6 +477,12 @@ def main() -> None:
     final_joint, final_fraction = measured_progress()
     maximum_fraction = max(row["range_fraction"] for row in trace)
     contact_steps = sum(row["target_contact_force_n"] > 0.1 for row in trace)
+    open_contact_steps = sum(
+        row["phase"] == "OPEN" and row["target_contact_force_n"] > 0.1 for row in trace
+    )
+    passive_baseline_failed = passive_baseline_drift > float(
+        ARGS.max_passive_drift_fraction
+    )
     result = {
         "schema_version": 1,
         "executor": "automoma_native_franka_isaac45",
@@ -466,9 +498,16 @@ def main() -> None:
         "maximum_range_fraction": maximum_fraction,
         "planning_target_fraction": float(ARGS.target_fraction),
         "acceptance_fraction": float(ARGS.acceptance_fraction),
-        "functional_open_success": maximum_fraction >= float(ARGS.acceptance_fraction),
+        "functional_open_success": (
+            maximum_fraction >= float(ARGS.acceptance_fraction)
+            and not passive_baseline_failed
+        ),
         "contact_steps": contact_steps,
         "contact_evidence": contact_steps > 0,
+        "open_contact_steps": open_contact_steps,
+        "passive_baseline_drift_fraction": passive_baseline_drift,
+        "max_passive_drift_fraction": float(ARGS.max_passive_drift_fraction),
+        "passive_baseline_failed": passive_baseline_failed,
         "object_joint_commands_issued": 0,
         "attachment_used": False,
         "penetration_audit_complete": False,
@@ -476,9 +515,12 @@ def main() -> None:
         "friction": friction,
         "trace_steps": len(trace),
     }
-    if result["functional_open_success"] and result["contact_evidence"]:
+    if result["functional_open_success"] and open_contact_steps > 0:
         result["provisional_physical_success"] = True
         result["failure_reason"] = "penetration_audit_pending"
+    elif passive_baseline_failed:
+        result["provisional_physical_success"] = False
+        result["failure_reason"] = "passive_joint_drift_before_robot_contact"
     else:
         result["provisional_physical_success"] = False
         result["failure_reason"] = "insufficient_opening_or_contact"
@@ -487,12 +529,7 @@ def main() -> None:
         json.dumps(result, indent=2), encoding="utf-8"
     )
     (ARGS.output_dir / "trace.json").write_text(json.dumps(trace), encoding="utf-8")
-    writer = imageio.get_writer(ARGS.output_dir / "multiview.mp4", fps=30)
-    try:
-        for frame in frames:
-            writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    finally:
-        writer.close()
+    write_video(ARGS.output_dir / "multiview.mp4", frames)
     print(json.dumps(result, indent=2), flush=True)
 
 
