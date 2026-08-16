@@ -95,6 +95,42 @@ def solve_ik(mg: MotionGen, pose: list[float], retract: torch.Tensor, seeds: int
     ).get_unique_solution()
 
 
+def tensor_to_numpy(value):
+    if value is None:
+        return None
+    return value.detach().cpu().numpy()
+
+
+def endpoint_diagnostics(mg: MotionGen, positions: torch.Tensor) -> tuple[list[bool], list[str]]:
+    feasible = []
+    statuses = []
+    for position in positions:
+        valid, status = mg.check_start_state(JointState.from_position(position))
+        feasible.append(bool(valid))
+        statuses.append("valid" if status is None else str(status))
+    return feasible, statuses
+
+
+def metric_summary(metrics) -> dict:
+    result = {}
+    for name in ("feasible", "constraint", "cost"):
+        value = getattr(metrics, name, None) if metrics is not None else None
+        if value is None:
+            result[name] = None
+            continue
+        array = tensor_to_numpy(value)
+        result[name] = {
+            "shape": list(array.shape),
+            "min": float(np.min(array)),
+            "max": float(np.max(array)),
+            "mean": float(np.mean(array)),
+        }
+        if name == "feasible":
+            result[name]["true_count"] = int(np.count_nonzero(array))
+            result[name]["total_count"] = int(array.size)
+    return result
+
+
 def main() -> None:
     args = parse_args()
     if not 0.0 < args.target_fraction <= 1.0:
@@ -165,6 +201,10 @@ def main() -> None:
     akr_mg = motion_gen(akr_cfg, tensor_args, seeds=min(args.ik_seeds, 512))
     start_state = JointState.from_position(start)
     goal_state = JointState.from_position(goal)
+    start_endpoint_feasible, start_endpoint_status = endpoint_diagnostics(akr_mg, start)
+    goal_endpoint_feasible, goal_endpoint_status = endpoint_diagnostics(akr_mg, goal)
+    start_constraint_metrics = akr_mg.check_constraints(start_state)
+    goal_constraint_metrics = akr_mg.check_constraints(goal_state)
     anchor_goal = akr_mg.ik_solver.fk(goal_state.position).ee_pose
     result = akr_mg.trajopt_solver.solve_batch(
         Goal(goal_pose=anchor_goal, goal_state=goal_state, current_state=start_state)
@@ -192,6 +232,18 @@ def main() -> None:
         args.output,
         start_states=start.detach().cpu().numpy(),
         goal_states=goal.detach().cpu().numpy(),
+        start_endpoint_feasible=np.asarray(start_endpoint_feasible),
+        goal_endpoint_feasible=np.asarray(goal_endpoint_feasible),
+        start_constraint_feasible=tensor_to_numpy(start_constraint_metrics.feasible),
+        start_constraint=tensor_to_numpy(start_constraint_metrics.constraint),
+        goal_constraint_feasible=tensor_to_numpy(goal_constraint_metrics.feasible),
+        goal_constraint=tensor_to_numpy(goal_constraint_metrics.constraint),
+        trajectory_metric_feasible=tensor_to_numpy(
+            result.metrics.feasible if result.metrics is not None else None
+        ),
+        trajectory_metric_constraint=tensor_to_numpy(
+            result.metrics.constraint if result.metrics is not None else None
+        ),
         trajectories=trajectories.numpy(),
         trajopt_success=success.numpy(),
         anchor_valid=np.asarray(valid),
@@ -215,6 +267,17 @@ def main() -> None:
         "goal_ik_count": len(goal_iks),
         "trajectory_count": len(trajectories),
         "trajopt_success_count": int(success.sum()),
+        "start_endpoint_feasible_count": int(np.count_nonzero(start_endpoint_feasible)),
+        "goal_endpoint_feasible_count": int(np.count_nonzero(goal_endpoint_feasible)),
+        "start_endpoint_status_counts": {
+            value: start_endpoint_status.count(value) for value in sorted(set(start_endpoint_status))
+        },
+        "goal_endpoint_status_counts": {
+            value: goal_endpoint_status.count(value) for value in sorted(set(goal_endpoint_status))
+        },
+        "start_constraint_metrics": metric_summary(start_constraint_metrics),
+        "goal_constraint_metrics": metric_summary(goal_constraint_metrics),
+        "trajectory_metrics": metric_summary(result.metrics),
         "anchor_valid_count": int(np.asarray(valid).sum()),
         "strict_physical_success": False,
         "strict_physical_pending": True,
