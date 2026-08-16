@@ -59,6 +59,8 @@ if ARGS.physics_hz <= 0:
     raise ValueError("--physics-hz must be positive")
 if ARGS.render_stride <= 0:
     raise ValueError("--render-stride must be positive")
+if ARGS.maximum_opening_seconds <= 0.0:
+    raise ValueError("--maximum-opening-seconds must be positive")
 if ARGS.maximum_interaction_lead_m < 0.0:
     raise ValueError("--maximum-interaction-lead-m must be non-negative")
 if ARGS.maximum_probe_interaction_lead_m < ARGS.maximum_interaction_lead_m:
@@ -682,6 +684,10 @@ def main() -> int:
     duration = max(4.0, 1.5 * base_path / 0.15, 1.5 * yaw_path / 0.2, 1.5 * robot_path / 0.5)
     duration = min(duration, float(ARGS.maximum_opening_seconds))
     nominal_steps = max(1, int(math.ceil(duration * ARGS.physics_hz)))
+    maximum_total_opening_steps = max(
+        nominal_steps,
+        int(math.ceil(float(ARGS.maximum_opening_seconds) * ARGS.physics_hz)),
+    )
     reference_progress = 0.0
     stalled_steps = 0
     opening_start_joint = float(_as_numpy(appliance.get_joint_positions()).reshape(-1)[target_index])
@@ -692,7 +698,7 @@ def main() -> int:
     latest_audit: dict[str, Any] = {}
     last_blocking_gates: list[str] = []
     opening_termination = "time_budget_exhausted"
-    for _ in range(nominal_steps + ARGS.physics_hz * 8):
+    for _ in range(maximum_total_opening_steps):
         reference = _sample_trajectory(trajectory, reference_progress)
         position_raw, quaternion_raw = base_probe.get_world_pose()
         measured_base = np.asarray(
@@ -889,6 +895,8 @@ def main() -> int:
             "collision_policy": collision_policy,
             "videos": videos,
             "step_count": step_count,
+            "nominal_opening_duration_seconds": duration,
+            "maximum_total_opening_seconds": ARGS.maximum_opening_seconds,
             "recorded_frame_count": recorder.frame_count,
             "skipped_empty_camera_frames": recorder.skipped_empty_frames,
             "opening_termination": opening_termination,
