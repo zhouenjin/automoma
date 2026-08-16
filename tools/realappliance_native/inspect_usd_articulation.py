@@ -30,6 +30,7 @@ from pxr import Usd, UsdGeom, UsdPhysics  # noqa: E402
 from automoma.integrations.realappliance_native.usd_articulation import (  # noqa: E402
     RealApplianceUsdManifest,
     UsdJointDescriptor,
+    UsdMeshGeometry,
     choose_open_joint_candidates,
 )
 
@@ -57,10 +58,40 @@ def inspect() -> RealApplianceUsdManifest:
 
     joints = []
     meshes = []
+    mesh_geometries = []
     rigid_bodies = []
-    for prim in stage.Traverse():
+    prims = tuple(stage.Traverse())
+    rigid_body_set = {
+        str(prim.GetPath())
+        for prim in prims
+        if prim.HasAPI(UsdPhysics.RigidBodyAPI)
+    }
+    bbox_cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        useExtentsHint=True,
+    )
+    for prim in prims:
         if prim.IsA(UsdGeom.Mesh):
-            meshes.append(str(prim.GetPath()))
+            mesh_path = str(prim.GetPath())
+            meshes.append(mesh_path)
+            owner = prim
+            while owner and str(owner.GetPath()) not in rigid_body_set:
+                owner = owner.GetParent()
+            rigid_body = str(owner.GetPath()) if owner else None
+            aligned_range = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            lower = aligned_range.GetMin()
+            upper = aligned_range.GetMax()
+            points = UsdGeom.Mesh(prim).GetPointsAttr().Get() or ()
+            mesh_geometries.append(
+                UsdMeshGeometry(
+                    path=mesh_path,
+                    rigid_body=rigid_body,
+                    world_bounds_min=tuple(float(value) for value in lower),
+                    world_bounds_max=tuple(float(value) for value in upper),
+                    point_count=len(points),
+                )
+            )
         if prim.HasAPI(UsdPhysics.RigidBodyAPI):
             rigid_bodies.append(str(prim.GetPath()))
 
@@ -106,6 +137,7 @@ def inspect() -> RealApplianceUsdManifest:
         joints=tuple(joints),
         mesh_paths=tuple(meshes),
         rigid_body_paths=tuple(rigid_bodies),
+        mesh_geometries=tuple(mesh_geometries),
     )
     if not choose_open_joint_candidates(manifest.joints):
         raise RuntimeError("USD contains no mechanically meaningful open candidates")

@@ -43,6 +43,81 @@ class UsdJointDescriptor:
 
 
 @dataclass(frozen=True)
+class UsdMeshGeometry:
+    """World-aligned geometry summary for one USD mesh."""
+
+    path: str
+    rigid_body: str | None
+    world_bounds_min: tuple[float, float, float]
+    world_bounds_max: tuple[float, float, float]
+    point_count: int
+
+    @property
+    def extent(self) -> tuple[float, float, float]:
+        return tuple(
+            max(0.0, upper - lower)
+            for lower, upper in zip(self.world_bounds_min, self.world_bounds_max)
+        )
+
+    @property
+    def volume(self) -> float:
+        x, y, z = self.extent
+        return x * y * z
+
+    def to_dict(self) -> dict[str, object]:
+        value = asdict(self)
+        value["extent"] = self.extent
+        return value
+
+
+@dataclass(frozen=True)
+class OpenJointComponent:
+    """A movable child link plus every rigid body fixed beneath it."""
+
+    joint: UsdJointDescriptor
+    rigid_bodies: tuple[str, ...]
+    mesh_paths: tuple[str, ...]
+    world_bounds_min: tuple[float, float, float] | None
+    world_bounds_max: tuple[float, float, float] | None
+    point_count: int
+
+    @property
+    def extent(self) -> tuple[float, float, float]:
+        if self.world_bounds_min is None or self.world_bounds_max is None:
+            return (0.0, 0.0, 0.0)
+        return tuple(
+            max(0.0, upper - lower)
+            for lower, upper in zip(self.world_bounds_min, self.world_bounds_max)
+        )
+
+    @property
+    def geometry_score(self) -> float:
+        """Coarse, asset-agnostic priority before learned grasp scoring.
+
+        Large articulated panels and drawers are evaluated before tiny knobs or
+        buttons.  This score never decides success or suppresses a mechanically
+        valid joint; the native grasp generator still evaluates every component.
+        """
+
+        x, y, z = self.extent
+        surface_proxy = x * y + y * z + z * x
+        return surface_proxy + 1.0e-7 * float(self.point_count)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "joint_path": self.joint.path,
+            "joint_type": self.joint.joint_type,
+            "rigid_bodies": list(self.rigid_bodies),
+            "mesh_paths": list(self.mesh_paths),
+            "world_bounds_min": self.world_bounds_min,
+            "world_bounds_max": self.world_bounds_max,
+            "extent": self.extent,
+            "point_count": self.point_count,
+            "geometry_score": self.geometry_score,
+        }
+
+
+@dataclass(frozen=True)
 class RealApplianceUsdManifest:
     """Planner-facing inventory extracted from one RealAppliance USD."""
 
@@ -51,14 +126,16 @@ class RealApplianceUsdManifest:
     joints: tuple[UsdJointDescriptor, ...]
     mesh_paths: tuple[str, ...]
     rigid_body_paths: tuple[str, ...]
+    mesh_geometries: tuple[UsdMeshGeometry, ...] = ()
 
     @property
     def openable_joints(self) -> tuple[UsdJointDescriptor, ...]:
         return tuple(joint for joint in self.joints if joint.movable)
 
     def to_dict(self) -> dict[str, object]:
+        components = build_open_joint_components(self)
         return {
-            "schema_version": "automoma.realappliance.usd_manifest.v1",
+            "schema_version": "automoma.realappliance.usd_manifest.v2",
             "provenance": {
                 "pipeline": "automoma_native",
                 "g2_inputs_used": False,
@@ -69,7 +146,70 @@ class RealApplianceUsdManifest:
             "openable_joint_paths": [joint.path for joint in self.openable_joints],
             "mesh_paths": list(self.mesh_paths),
             "rigid_body_paths": list(self.rigid_body_paths),
+            "mesh_geometries": [geometry.to_dict() for geometry in self.mesh_geometries],
+            "open_joint_components": [component.to_dict() for component in components],
         }
+
+
+def _fixed_descendants(
+    root_body: str, joints: Iterable[UsdJointDescriptor]
+) -> tuple[str, ...]:
+    children: dict[str, list[str]] = {}
+    for joint in joints:
+        if joint.joint_type != "fixed" or not joint.parent_body or not joint.child_body:
+            continue
+        children.setdefault(joint.parent_body, []).append(joint.child_body)
+
+    ordered = []
+    stack = [root_body]
+    seen = set()
+    while stack:
+        body = stack.pop()
+        if body in seen:
+            continue
+        seen.add(body)
+        ordered.append(body)
+        stack.extend(reversed(children.get(body, ())))
+    return tuple(ordered)
+
+
+def build_open_joint_components(
+    manifest: RealApplianceUsdManifest,
+) -> tuple[OpenJointComponent, ...]:
+    """Build geometry components for every openable joint without ID rules."""
+
+    components = []
+    for joint in choose_open_joint_candidates(manifest.joints):
+        assert joint.child_body is not None
+        bodies = _fixed_descendants(joint.child_body, manifest.joints)
+        body_set = set(bodies)
+        geometries = tuple(
+            geometry
+            for geometry in manifest.mesh_geometries
+            if geometry.rigid_body in body_set
+        )
+        bounds_min = None
+        bounds_max = None
+        if geometries:
+            bounds_min = tuple(
+                min(geometry.world_bounds_min[index] for geometry in geometries)
+                for index in range(3)
+            )
+            bounds_max = tuple(
+                max(geometry.world_bounds_max[index] for geometry in geometries)
+                for index in range(3)
+            )
+        components.append(
+            OpenJointComponent(
+                joint=joint,
+                rigid_bodies=bodies,
+                mesh_paths=tuple(geometry.path for geometry in geometries),
+                world_bounds_min=bounds_min,
+                world_bounds_max=bounds_max,
+                point_count=sum(geometry.point_count for geometry in geometries),
+            )
+        )
+    return tuple(sorted(components, key=lambda value: value.geometry_score, reverse=True))
 
 
 def choose_open_joint_candidates(

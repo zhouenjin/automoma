@@ -7,6 +7,8 @@ from automoma.integrations.realappliance_native import (
     OpenEpisodeSample,
     RealApplianceUsdManifest,
     UsdJointDescriptor,
+    UsdMeshGeometry,
+    build_open_joint_components,
     choose_open_joint_candidates,
 )
 from automoma.integrations.realappliance_native.contracts import (
@@ -121,3 +123,58 @@ def test_usd_inventory_selects_all_openable_joints_without_asset_id_rules() -> N
         rigid_body_paths=("/World/body", "/World/door"),
     )
     assert manifest.to_dict()["provenance"]["g2_inputs_used"] is False
+
+
+def test_open_component_includes_fixed_handle_and_ranks_large_door_first() -> None:
+    door = UsdJointDescriptor(
+        path="/World/door/hinge",
+        joint_type="revolute",
+        parent_body="/World/body",
+        child_body="/World/door",
+        axis="Y",
+        lower_limit=0.0,
+        upper_limit=90.0,
+        local_position_parent=(0.0, 0.0, 0.0),
+        local_position_child=(0.0, 0.0, 0.0),
+    )
+    handle = UsdJointDescriptor(
+        path="/World/handle/fixed",
+        joint_type="fixed",
+        parent_body="/World/door",
+        child_body="/World/handle",
+        axis=None,
+        lower_limit=None,
+        upper_limit=None,
+        local_position_parent=(0.0, 0.0, 0.0),
+        local_position_child=(0.0, 0.0, 0.0),
+    )
+    knob = UsdJointDescriptor(
+        path="/World/knob/hinge",
+        joint_type="revolute",
+        parent_body="/World/body",
+        child_body="/World/knob",
+        axis="Y",
+        lower_limit=-90.0,
+        upper_limit=90.0,
+        local_position_parent=(0.0, 0.0, 0.0),
+        local_position_child=(0.0, 0.0, 0.0),
+    )
+    geometries = (
+        UsdMeshGeometry("/World/door/mesh", "/World/door", (0, 0, 0), (1, 1, 0.1), 100),
+        UsdMeshGeometry("/World/handle/mesh", "/World/handle", (0, 0, 0), (0.5, 0.1, 0.1), 50),
+        UsdMeshGeometry("/World/knob/mesh", "/World/knob", (0, 0, 0), (0.05, 0.05, 0.05), 20),
+    )
+    manifest = RealApplianceUsdManifest(
+        asset_id="unseen",
+        source_usd="/tmp/Aligned.usd",
+        joints=(door, handle, knob),
+        mesh_paths=tuple(value.path for value in geometries),
+        rigid_body_paths=("/World/body", "/World/door", "/World/handle", "/World/knob"),
+        mesh_geometries=geometries,
+    )
+
+    components = build_open_joint_components(manifest)
+
+    assert components[0].joint.path == door.path
+    assert components[0].rigid_bodies == ("/World/door", "/World/handle")
+    assert "/World/handle/mesh" in components[0].mesh_paths
