@@ -47,6 +47,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-probe-after-seconds", type=float, default=0.5)
     parser.add_argument("--probe-lead-ramp-seconds", type=float, default=1.0)
     parser.add_argument("--progress-epsilon-fraction", type=float, default=0.0005)
+    parser.add_argument("--initial-contact-acquisition-seconds", type=float, default=1.0)
     parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.008)
     parser.add_argument("--maximum-contact-base-tracking-error-m", type=float, default=0.015)
     parser.add_argument("--maximum-base-yaw-error-rad", type=float, default=0.02)
@@ -69,6 +70,8 @@ if ARGS.progress_probe_after_seconds < 0.0 or ARGS.probe_lead_ramp_seconds <= 0.
     raise ValueError("probe timing must be non-negative with a positive ramp duration")
 if ARGS.progress_epsilon_fraction <= 0.0:
     raise ValueError("--progress-epsilon-fraction must be positive")
+if ARGS.initial_contact_acquisition_seconds <= 0.0:
+    raise ValueError("--initial-contact-acquisition-seconds must be positive")
 if not math.isfinite(ARGS.planner_effort_multiplier) or ARGS.planner_effort_multiplier <= 0.0:
     raise ValueError("--planner-effort-multiplier must be finite and positive")
 if not math.isfinite(ARGS.base_effort_multiplier) or ARGS.base_effort_multiplier <= 0.0:
@@ -698,7 +701,7 @@ def main() -> int:
     latest_audit: dict[str, Any] = {}
     last_blocking_gates: list[str] = []
     opening_termination = "time_budget_exhausted"
-    for _ in range(maximum_total_opening_steps):
+    for opening_step in range(maximum_total_opening_steps):
         reference = _sample_trajectory(trajectory, reference_progress)
         position_raw, quaternion_raw = base_probe.get_world_pose()
         measured_base = np.asarray(
@@ -834,6 +837,13 @@ def main() -> int:
         if stalled_steps > ARGS.physics_hz * 8:
             opening_termination = "control_stalled"
             break
+        if (
+            not contact_during_opening
+            and reference_progress <= 1.0e-12
+            and opening_step + 1 >= int(math.ceil(ARGS.initial_contact_acquisition_seconds * ARGS.physics_hz))
+        ):
+            opening_termination = "initial_selected_contact_not_acquired"
+            break
 
     robot.set_joint_velocity_targets(np.zeros((1, 4), dtype=np.float32), joint_indices=wheel_indices)
     phase = "final_hold"
@@ -897,6 +907,7 @@ def main() -> int:
             "step_count": step_count,
             "nominal_opening_duration_seconds": duration,
             "maximum_total_opening_seconds": ARGS.maximum_opening_seconds,
+            "initial_contact_acquisition_seconds": ARGS.initial_contact_acquisition_seconds,
             "recorded_frame_count": recorder.frame_count,
             "skipped_empty_camera_frames": recorder.skipped_empty_frames,
             "opening_termination": opening_termination,
