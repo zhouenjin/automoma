@@ -220,18 +220,23 @@ def build_akr_robot_config(
         "joint_limits": akr_limits,
     }
     kinematics["extra_links"] = extras
+    # The reversed chain terminates at the stationary appliance body.  Making
+    # that anchor the planning EE is what couples robot motion to object motion:
+    # trajectories must keep the appliance body pose fixed while q_object moves.
+    kinematics["ee_link"] = anchor_link
 
     collision_spheres = kinematics.get("collision_spheres")
     spheres = component_collision_spheres(manifest, component)
+    counts = dict(kinematics.get("extra_collision_spheres", {}))
+    counts.pop("attached_object", None)
     if isinstance(collision_spheres, dict):
         collision_spheres[component_link] = [
             {"center": [x, y, z], "radius": radius} for x, y, z, radius in spheres
         ]
+        kinematics["extra_collision_spheres"] = counts
     else:
         # cuRobo allocates placeholders which the runtime adapter replaces after
         # resolving the stock Franka sphere file.
-        counts = dict(kinematics.get("extra_collision_spheres", {}))
-        counts.pop("attached_object", None)
         counts[component_link] = len(spheres)
         kinematics["extra_collision_spheres"] = counts
 
