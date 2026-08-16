@@ -5,7 +5,13 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from automoma.integrations.realappliance.contracts import ArticulationTaskSpec, JointKind, PhysicsRunPolicy
-from automoma.integrations.realappliance.g2_adapter import Hand, build_planar_g2_urdf, make_g2_curobo_config
+from automoma.integrations.realappliance.g2_adapter import (
+    Bounds3D,
+    Hand,
+    build_planar_g2_urdf,
+    fit_bounds_with_spheres,
+    make_g2_curobo_config,
+)
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
 
 
@@ -55,13 +61,37 @@ def test_curobo_config_enumerates_base_and_selected_hand(tmp_path):
             }
         }
     }
-    result = make_g2_curobo_config(source, tmp_path / "g2_planar.urdf", Hand.LEFT)
+    spheres = fit_bounds_with_spheres(Bounds3D((-0.4, -0.3, 0.0), (0.4, 0.3, 0.4)))
+    mesh_root = tmp_path / "source_mesh_root"
+    result = make_g2_curobo_config(
+        source, tmp_path / "g2_planar.urdf", Hand.LEFT, asset_root_path=mesh_root, base_collision_spheres=spheres,
+    )
     kin = result["robot_cfg"]["kinematics"]
 
     assert kin["base_link"] == "automoma_world"
     assert kin["ee_link"] == "left_gripper_center"
+    assert kin["asset_root_path"] == str(mesh_root)
+    assert kin["collision_spheres"]["base_link"] == spheres
     assert kin["cspace"]["joint_names"] == ["base_x", "base_y", "base_yaw", "body_joint"]
     assert len(kin["cspace"]["retract_config"]) == 4
+
+
+def test_base_collision_lattice_covers_bounds():
+    bounds = Bounds3D((-0.4, -0.3, 0.0), (0.4, 0.3, 0.4))
+    spheres = fit_bounds_with_spheres(bounds, cells=(4, 3, 2), margin=0.0)
+    assert len(spheres) == 24
+    radius = spheres[0]["radius"]
+    assert radius > 0.0
+    for corner in (
+        (x, y, z)
+        for x in (bounds.minimum[0], bounds.maximum[0])
+        for y in (bounds.minimum[1], bounds.maximum[1])
+        for z in (bounds.minimum[2], bounds.maximum[2])
+    ):
+        assert (
+            min(sum((corner[index] - sphere["center"][index]) ** 2 for index in range(3)) ** 0.5 for sphere in spheres)
+            <= radius + 1e-12
+        )
 
 
 def test_hypothesis_pool_contains_both_hands_without_asset_rules():

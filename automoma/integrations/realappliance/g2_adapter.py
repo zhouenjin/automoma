@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import copy
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 class Hand(str, Enum):
@@ -22,6 +23,14 @@ class PlanarBaseLimits:
     yaw: tuple[float, float] = (-3.141592653589793, 3.141592653589793)
     linear_velocity: float = 0.6
     angular_velocity: float = 0.8
+
+
+@dataclass(frozen=True)
+class Bounds3D:
+    """Axis-aligned bounds expressed in a URDF link frame."""
+
+    minimum: Tuple[float, float, float]
+    maximum: Tuple[float, float, float]
 
 
 _WORLD_LINK = "automoma_world"
@@ -123,9 +132,127 @@ def build_planar_g2_urdf(
         robot.insert(offset, element)
 
     output_urdf.parent.mkdir(parents=True, exist_ok=True)
-    ET.indent(tree, space="  ")
+    if hasattr(ET, "indent"):
+        ET.indent(tree, space="  ")
     tree.write(output_urdf, encoding="utf-8", xml_declaration=True)
     return output_urdf
+
+
+def _parse_vector(text: Optional[str], *, default: Sequence[float]) -> Tuple[float, ...]:
+    if text is None:
+        return tuple(float(value) for value in default)
+    values = tuple(float(value) for value in text.split())
+    if len(values) != len(default):
+        raise ValueError(f"expected {len(default)} values, got {len(values)} in {text!r}")
+    return values
+
+
+def _rotate_rpy(point: Sequence[float], rpy: Sequence[float]) -> Tuple[float, float, float]:
+    """Apply URDF fixed-axis roll/pitch/yaw rotation without third-party dependencies."""
+
+    x, y, z = (float(value) for value in point)
+    roll, pitch, yaw = (float(value) for value in rpy)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return (
+        (cy * cp) * x + (cy * sp * sr - sy * cr) * y + (cy * sp * cr + sy * sr) * z,
+        (sy * cp) * x + (sy * sp * sr + cy * cr) * y + (sy * sp * cr - cy * sr) * z,
+        (-sp) * x + (cp * sr) * y + (cp * cr) * z,
+    )
+
+
+def _dae_position_vertices(path: Path) -> Iterable[Tuple[float, float, float]]:
+    root = ET.parse(path).getroot()
+    found = False
+    for element in root.iter():
+        if not element.tag.endswith("float_array") or "POSITION" not in element.attrib.get("id", "").upper():
+            continue
+        values = [float(value) for value in (element.text or "").split()]
+        if len(values) % 3:
+            raise ValueError(f"position array in {path} does not contain XYZ triples")
+        found = True
+        for index in range(0, len(values), 3):
+            yield values[index], values[index + 1], values[index + 2]
+    if not found:
+        raise ValueError(f"no COLLADA position arrays found in {path}")
+
+
+def infer_link_visual_bounds(source_urdf: Path, link_name: str) -> Bounds3D:
+    """Infer visual bounds for one robot link, currently supporting DAE and boxes."""
+
+    root = ET.parse(source_urdf).getroot()
+    link = root.find(f"./link[@name='{link_name}']")
+    if link is None:
+        raise ValueError(f"link {link_name!r} is absent from {source_urdf}")
+
+    points: List[Tuple[float, float, float]] = []
+    for visual in link.findall("visual"):
+        origin = visual.find("origin")
+        xyz = _parse_vector(origin.attrib.get("xyz") if origin is not None else None, default=(0.0, 0.0, 0.0))
+        rpy = _parse_vector(origin.attrib.get("rpy") if origin is not None else None, default=(0.0, 0.0, 0.0))
+        geometry = visual.find("geometry")
+        if geometry is None:
+            continue
+        mesh = geometry.find("mesh")
+        box = geometry.find("box")
+        local_points: Iterable[Tuple[float, float, float]]
+        scale = (1.0, 1.0, 1.0)
+        if mesh is not None:
+            filename = mesh.attrib.get("filename")
+            if not filename:
+                continue
+            mesh_path = (source_urdf.parent / filename).resolve()
+            if mesh_path.suffix.lower() != ".dae":
+                raise ValueError(f"unsupported visual mesh format for bounds: {mesh_path}")
+            scale = _parse_vector(mesh.attrib.get("scale"), default=(1.0, 1.0, 1.0))
+            local_points = _dae_position_vertices(mesh_path)
+        elif box is not None:
+            size = _parse_vector(box.attrib.get("size"), default=(0.0, 0.0, 0.0))
+            local_points = (
+                (sx * size[0] / 2.0, sy * size[1] / 2.0, sz * size[2] / 2.0)
+                for sx in (-1.0, 1.0)
+                for sy in (-1.0, 1.0)
+                for sz in (-1.0, 1.0)
+            )
+        else:
+            continue
+
+        for point in local_points:
+            scaled = tuple(point[index] * scale[index] for index in range(3))
+            rotated = _rotate_rpy(scaled, rpy)
+            points.append(tuple(rotated[index] + xyz[index] for index in range(3)))
+
+    if not points:
+        raise ValueError(f"link {link_name!r} has no supported visual geometry")
+    minimum = tuple(min(point[index] for point in points) for index in range(3))
+    maximum = tuple(max(point[index] for point in points) for index in range(3))
+    return Bounds3D(minimum=minimum, maximum=maximum)
+
+
+def fit_bounds_with_spheres(
+    bounds: Bounds3D, *, cells: Sequence[int] = (4, 3, 2), margin: float = 0.005,
+) -> List[Dict[str, Any]]:
+    """Conservatively cover link bounds with a regular sphere lattice."""
+
+    if len(cells) != 3 or any(count <= 0 for count in cells):
+        raise ValueError("cells must contain three positive integers")
+    widths = tuple(bounds.maximum[index] - bounds.minimum[index] for index in range(3))
+    steps = tuple(widths[index] / cells[index] for index in range(3))
+    radius = 0.5 * math.sqrt(sum(step * step for step in steps)) + margin
+    return [
+        {
+            "center": [
+                bounds.minimum[0] + (ix + 0.5) * steps[0],
+                bounds.minimum[1] + (iy + 0.5) * steps[1],
+                bounds.minimum[2] + (iz + 0.5) * steps[2],
+            ],
+            "radius": radius,
+        }
+        for ix in range(cells[0])
+        for iy in range(cells[1])
+        for iz in range(cells[2])
+    ]
 
 
 def _prepend(values: Any, prefix: Iterable[float]) -> Any:
@@ -139,6 +266,8 @@ def make_g2_curobo_config(
     generated_urdf: Path,
     hand: Hand,
     *,
+    asset_root_path: Optional[Path] = None,
+    base_collision_spheres: Optional[Sequence[Mapping[str, Any]]] = None,
     base_null_space_weight: Sequence[float] = (1.0, 1.0, 1.0),
     base_distance_weight: Sequence[float] = (1.0, 1.0, 1.0),
 ) -> Dict[str, Any]:
@@ -160,9 +289,19 @@ def make_g2_curobo_config(
         raise ValueError("source cspace already contains AutoMoMa planar-base joints")
 
     kinematics["urdf_path"] = str(generated_urdf)
-    kinematics["asset_root_path"] = str(generated_urdf.parent)
+    kinematics["asset_root_path"] = str(asset_root_path or generated_urdf.parent)
     kinematics["base_link"] = _WORLD_LINK
     kinematics["ee_link"] = "left_gripper_center" if hand is Hand.LEFT else "right_gripper_center"
+    if base_collision_spheres is not None:
+        collision_spheres = kinematics.get("collision_spheres")
+        if collision_spheres is None:
+            collision_spheres = {}
+            kinematics["collision_spheres"] = collision_spheres
+        elif not isinstance(collision_spheres, dict):
+            raise ValueError("robot_cfg.kinematics.collision_spheres must be a mapping")
+        if "base_link" in collision_spheres:
+            raise ValueError("source config already contains base_link collision spheres")
+        collision_spheres["base_link"] = [dict(sphere) for sphere in base_collision_spheres]
 
     cspace["joint_names"] = list(_BASE_JOINTS) + joint_names
     cspace["retract_config"] = _prepend(cspace.get("retract_config", []), (0.0, 0.0, 0.0))
@@ -172,7 +311,13 @@ def make_g2_curobo_config(
     cspace["max_jerk"] = _prepend(cspace.get("max_jerk"), (10.0, 10.0, 10.0))
 
     expected = len(cspace["joint_names"])
-    for key in ("retract_config", "null_space_weight", "cspace_distance_weight"):
+    for key in (
+        "retract_config",
+        "null_space_weight",
+        "cspace_distance_weight",
+        "max_acceleration",
+        "max_jerk",
+    ):
         values = cspace.get(key)
         if not isinstance(values, list) or len(values) != expected:
             actual = len(values) if isinstance(values, list) else "non-list"

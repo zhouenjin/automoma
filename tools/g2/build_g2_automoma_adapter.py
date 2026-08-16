@@ -18,6 +18,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from automoma.integrations.realappliance.g2_adapter import (  # noqa: E402
     Hand,
     build_planar_g2_urdf,
+    fit_bounds_with_spheres,
+    infer_link_visual_bounds,
     make_g2_curobo_config,
 )
 
@@ -39,13 +41,28 @@ def main() -> int:
     source_urdf = args.g2_root / "assets" / "urdf" / "g2_crsB_swiftpicker_curobo.urdf"
     generated_urdf = args.output_dir / "g2_crsB_swiftpicker_automoma_planar.urdf"
     build_planar_g2_urdf(source_urdf, generated_urdf)
+    base_bounds = infer_link_visual_bounds(source_urdf, "base_link")
+    base_collision_spheres = fit_bounds_with_spheres(base_bounds)
 
-    outputs = {"urdf": str(generated_urdf), "urdf_sha256": _sha256(generated_urdf), "hands": {}}
+    outputs = {
+        "urdf": str(generated_urdf),
+        "urdf_sha256": _sha256(generated_urdf),
+        "mesh_root": str(source_urdf.parent),
+        "base_bounds": {"minimum": base_bounds.minimum, "maximum": base_bounds.maximum},
+        "base_collision_sphere_count": len(base_collision_spheres),
+        "hands": {},
+    }
     for hand in (Hand.LEFT, Hand.RIGHT):
         source_yaml = args.g2_root / "curobo" / f"whole_body_{hand.value}.yml"
         with source_yaml.open("r", encoding="utf-8") as stream:
             source_config = yaml.safe_load(stream)
-        generated_config = make_g2_curobo_config(source_config, generated_urdf, hand)
+        generated_config = make_g2_curobo_config(
+            source_config,
+            generated_urdf,
+            hand,
+            asset_root_path=source_urdf.parent,
+            base_collision_spheres=base_collision_spheres,
+        )
         output_yaml = args.output_dir / f"g2_automoma_{hand.value}.yml"
         output_yaml.parent.mkdir(parents=True, exist_ok=True)
         with output_yaml.open("w", encoding="utf-8") as stream:

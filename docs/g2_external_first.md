@@ -28,10 +28,11 @@ AutoMoMa remains responsible for:
 The adapter is responsible for:
 
 1. exposing G2 planar base, body, and one selected arm as a cuRobo cspace;
-2. generating both left- and right-hand hypotheses;
-3. converting RealAppliance articulation metadata into an AutoMoMa task;
-4. executing the robot-only trajectory in Isaac Sim drive mode;
-5. enforcing the stricter physical-success contract.
+2. conservatively fitting planner collision spheres to the G2 base visual bounds;
+3. generating both left- and right-hand hypotheses;
+4. converting RealAppliance articulation metadata into an AutoMoMa task;
+5. executing the robot-only trajectory in Isaac Sim drive mode;
+6. enforcing the stricter physical-success contract.
 
 Legacy G2 plan selection, fixed base-share controllers, fixed world-frame pulls, and per-asset tuning are not imported.
 
@@ -66,4 +67,3 @@ Therefore the first executable gate is AutoMoMa planning on a separate CUDA 11.8
 7. Obtain three unadapted assets with one strict success each, then three successes each.
 
 At every gate, a failure is saved with the exact environment, command, traceback, and smallest unresolved interface mismatch.
-
