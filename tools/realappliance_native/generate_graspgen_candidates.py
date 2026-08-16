@@ -28,6 +28,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-grasps", type=int, default=500)
     parser.add_argument("--topk", type=int, default=200)
     parser.add_argument("--minimum-body-points", type=int, default=256)
+    parser.add_argument(
+        "--target-body-path",
+        action="append",
+        default=[],
+        help=(
+            "Restrict inference to one or more interaction rigid bodies. "
+            "The remaining component geometry is retained as collision context."
+        ),
+    )
+    parser.add_argument("--filter-scene-collisions", action="store_true")
+    parser.add_argument("--collision-threshold-m", type=float, default=0.003)
+    parser.add_argument("--collision-samples", type=int, default=4000)
     return parser.parse_args()
 
 
@@ -59,13 +71,40 @@ def main() -> None:
     socket.connect(f"tcp://{args.host}:{args.port}")
     server = request(socket, {"action": "metadata"})
 
-    inputs = [("component", points)]
+    selected_paths = set(args.target_body_path)
+    unknown_paths = selected_paths.difference(body_paths)
+    if unknown_paths:
+        raise RuntimeError(f"target bodies are absent from cloud: {sorted(unknown_paths)}")
+
+    inputs = [] if selected_paths else [("component", points, np.empty((0, 3)))]
     for index, body_path in enumerate(body_paths):
         body_points = points[body_index == index]
+        if selected_paths and body_path not in selected_paths:
+            continue
         if len(body_points) >= args.minimum_body_points:
-            inputs.append((body_path, body_points))
+            scene_points = points[body_index != index]
+            inputs.append((body_path, body_points, scene_points))
+    if not inputs:
+        raise RuntimeError("no interaction body has enough points for inference")
+
+    gripper_surface_points = None
+    collision_filter = None
+    if args.filter_scene_collisions:
+        import trimesh
+
+        from grasp_gen.robot import get_gripper_info
+        from grasp_gen.utils.point_cloud_utils import filter_colliding_grasps_fast
+
+        gripper_info = get_gripper_info(server["gripper_name"])
+        sampled, _ = trimesh.sample.sample_surface(
+            gripper_info.collision_mesh, args.collision_samples
+        )
+        gripper_surface_points = np.asarray(sampled, dtype=np.float32)
+        collision_filter = filter_colliding_grasps_fast
+
     records = []
-    for source, inference_points in inputs:
+    collision_statistics = []
+    for source, inference_points, scene_points in inputs:
         response = request(
             socket,
             {
@@ -81,6 +120,24 @@ def main() -> None:
         )
         poses = np.asarray(response["grasps"], dtype=np.float32)
         confidence = np.asarray(response["confidences"], dtype=np.float32).reshape(-1)
+        before_collision_filter = len(poses)
+        if collision_filter is not None:
+            keep = collision_filter(
+                scene_pc=scene_points,
+                grasp_poses=poses,
+                collision_threshold=args.collision_threshold_m,
+                gripper_surface_points=gripper_surface_points,
+            )
+            poses = poses[keep]
+            confidence = confidence[keep]
+        collision_statistics.append(
+            {
+                "source_component": source,
+                "scene_point_count": len(scene_points),
+                "before": before_collision_filter,
+                "after": len(poses),
+            }
+        )
         for pose, score in zip(poses, confidence):
             if pose.shape != (4, 4) or not np.isfinite(pose).all() or not np.isfinite(score):
                 continue
@@ -113,6 +170,13 @@ def main() -> None:
             "depth": gripper.get("depth"),
         },
         "component_cloud": str(args.component_cloud),
+        "target_body_paths": list(args.target_body_path),
+        "scene_collision_filter": {
+            "enabled": bool(args.filter_scene_collisions),
+            "threshold_m": args.collision_threshold_m,
+            "surface_samples": args.collision_samples,
+            "statistics": collision_statistics,
+        },
         "candidate_count": len(candidates),
         "candidates": candidates,
     }
