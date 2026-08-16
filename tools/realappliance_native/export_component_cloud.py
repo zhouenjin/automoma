@@ -109,6 +109,43 @@ def export() -> dict[str, object]:
     if stage is None:
         raise RuntimeError(f"failed to open {manifest.source_usd}")
     component_prim = stage.GetPrimAtPath(component.joint.child_body)
+    component_to_world = np.asarray(
+        UsdGeom.Xformable(component_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        ),
+        dtype=np.float64,
+    ).T
+    component_to_world[:3, 3] *= manifest.meters_per_unit
+    axis_lookup = {
+        "X": Gf.Vec3d(1.0, 0.0, 0.0),
+        "Y": Gf.Vec3d(0.0, 1.0, 0.0),
+        "Z": Gf.Vec3d(0.0, 0.0, 1.0),
+    }
+    parent_prim = stage.GetPrimAtPath(component.joint.parent_body)
+    parent_to_world_raw = UsdGeom.Xformable(parent_prim).ComputeLocalToWorldTransform(
+        Usd.TimeCode.Default()
+    )
+    parent_joint_rotation = Gf.Rotation(
+        Gf.Quatd(
+            component.joint.local_rotation_parent_wxyz[0],
+            Gf.Vec3d(*component.joint.local_rotation_parent_wxyz[1:]),
+        )
+    )
+    axis_parent = parent_joint_rotation.TransformDir(axis_lookup[component.joint.axis])
+    axis_world = np.asarray(
+        tuple(float(value) for value in parent_to_world_raw.TransformDir(axis_parent)),
+        dtype=np.float64,
+    )
+    axis_world /= np.linalg.norm(axis_world)
+    pivot_world = np.asarray(
+        tuple(
+            float(value)
+            for value in parent_to_world_raw.Transform(
+                Gf.Vec3d(*component.joint.local_position_parent)
+            )
+        ),
+        dtype=np.float64,
+    ) * manifest.meters_per_unit
     rigid_body_set = set(manifest.rigid_body_paths)
     body_to_triangles: dict[str, list[np.ndarray]] = {body: [] for body in component.rigid_bodies}
     for prim in stage.Traverse():
@@ -151,6 +188,9 @@ def export() -> dict[str, object]:
         body_paths=np.asarray(exported_bodies),
         joint_path=np.asarray(component.joint.path),
         component_body_path=np.asarray(component.joint.child_body),
+        component_to_world=component_to_world.astype(np.float32),
+        joint_axis_world=axis_world.astype(np.float32),
+        joint_pivot_world_m=pivot_world.astype(np.float32),
     )
     metadata = {
         "schema_version": "automoma.realappliance.component_cloud.v1",
@@ -161,6 +201,9 @@ def export() -> dict[str, object]:
         "component_body_path": component.joint.child_body,
         "body_paths": exported_bodies,
         "point_count": int(sum(len(value) for value in point_blocks)),
+        "component_to_world": component_to_world.tolist(),
+        "joint_axis_world": axis_world.tolist(),
+        "joint_pivot_world_m": pivot_world.tolist(),
         "output": str(ARGS.output),
     }
     ARGS.output.with_suffix(".json").write_text(
