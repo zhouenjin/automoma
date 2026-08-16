@@ -308,9 +308,9 @@ def main() -> None:
     ]
     if len(finger_indices) == 2:
         baseline_effort = np.asarray(
-            franka.get_max_efforts(joint_indices=finger_indices), dtype=np.float32
-        ).reshape(-1)
-        franka.set_max_efforts(
+            robot_controller.get_max_efforts(), dtype=np.float32
+        ).reshape(-1)[finger_indices]
+        robot_controller.set_max_efforts(
             baseline_effort * float(ARGS.finger_effort_multiplier),
             joint_indices=finger_indices,
         )
