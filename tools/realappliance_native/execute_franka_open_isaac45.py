@@ -63,7 +63,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--joint-plan-npz", type=Path)
     result.add_argument("--asset-translation", default="0.55,0.0,0.55")
     result.add_argument("--asset-yaw-rad", type=float, default=0.0)
-    result.add_argument("--robot-translation", default="0.10,-0.35,0.0")
+    result.add_argument(
+        "--robot-translation",
+        help=(
+            "Robot-base translation. Defaults to the cuRobo world origin for a "
+            "joint-plan replay and to the legacy heuristic offset otherwise."
+        ),
+    )
     result.add_argument("--precontact-distance-m", type=float, default=0.12)
     result.add_argument("--contact-offset-m", type=float, default=-0.002)
     result.add_argument("--target-fraction", type=float, default=0.80)
@@ -137,8 +143,15 @@ def parse_inputs() -> dict[str, np.ndarray]:
         "joint_axis": csv_vector(ARGS.joint_axis, 3),
         "joint_pivot": csv_vector(ARGS.joint_pivot, 3),
         "asset_translation": csv_vector(ARGS.asset_translation, 3),
-        "robot_translation": csv_vector(ARGS.robot_translation, 3),
     }
+    if ARGS.robot_translation is None:
+        values["robot_translation"] = (
+            np.zeros(3, dtype=np.float64)
+            if ARGS.joint_plan_npz is not None
+            else np.asarray([0.10, -0.35, 0.0], dtype=np.float64)
+        )
+    else:
+        values["robot_translation"] = csv_vector(ARGS.robot_translation, 3)
     if ARGS.joint_plan_npz is None:
         missing = [
             name
@@ -473,6 +486,20 @@ def main() -> None:
             joint_indices=finger_indices,
         )
 
+    arm_indices: list[int] = []
+    arm_path: np.ndarray | None = None
+    if ARGS.joint_plan_npz is not None:
+        arm_indices = [
+            index
+            for index, name in enumerate(franka.dof_names)
+            if name.startswith("panda_joint")
+        ]
+        if len(arm_indices) != 7:
+            raise RuntimeError(
+                f"expected seven Franka arm joints, got {franka.dof_names}"
+            )
+        arm_path = values["joint_plan"][:, :7]
+
     if ARGS.joint_plan_npz is None:
         contact_source = values["contact_center"] + values["approach_direction"] * float(
             ARGS.contact_offset_m
@@ -607,6 +634,34 @@ def main() -> None:
             world.step(render=render)
             record_step(phase, render)
 
+    def step_arm_target(
+        phase: str,
+        target: np.ndarray,
+        steps: int,
+        gripper_width: float,
+    ) -> None:
+        """Smoothly converge to a cuRobo joint target while preserving logging."""
+
+        current = np.asarray(franka.get_joint_positions(), dtype=np.float64)[
+            arm_indices
+        ]
+        for alpha in np.linspace(0.0, 1.0, steps, endpoint=True)[1:]:
+            command = current + alpha * (target - current)
+            robot_controller.apply_action(
+                ArticulationAction(
+                    joint_positions=command,
+                    joint_indices=arm_indices,
+                )
+            )
+            franka.gripper.apply_action(
+                ArticulationAction(
+                    joint_positions=[gripper_width, gripper_width]
+                )
+            )
+            render = step_count % int(ARGS.render_stride) == 0
+            world.step(render=render)
+            record_step(phase, render)
+
     for _ in range(int(ARGS.passive_baseline_steps)):
         render = step_count % int(ARGS.render_stride) == 0
         world.step(render=render)
@@ -614,11 +669,31 @@ def main() -> None:
     _, passive_baseline_drift = measured_progress()
 
     step_pose("PRECONTACT", precontact_world, orientation, 300, 0.04)
-    step_pose("CONTACT", contact_world, orientation, 180, 0.04)
-    step_pose("CLOSE", contact_world, orientation, 180, 0.0)
+    if arm_path is None:
+        step_pose("CONTACT", contact_world, orientation, 180, 0.04)
+        step_pose("CLOSE", contact_world, orientation, 180, 0.0)
+    else:
+        # The AKR manifold begins at the exact GraspGen contact configuration.
+        # RMPFlow targets a different synthetic gripper frame and can finish a
+        # few centimetres away even when cuRobo found a valid contact state.
+        # Converge to the planned start before closing so the physical replay
+        # actually executes the candidate that was scored and collision checked.
+        step_arm_target("CONTACT_PLAN", arm_path[0], 180, 0.04)
+        step_arm_target("CLOSE", arm_path[0], 180, 0.0)
+
+    plan_contact_joint_error_rad: float | None = None
+    if arm_path is not None:
+        measured_arm = np.asarray(
+            franka.get_joint_positions(), dtype=np.float64
+        )[arm_indices]
+        plan_contact_joint_error_rad = float(
+            np.max(np.abs(measured_arm - arm_path[0]))
+        )
 
     contact_audit_rows = [
-        row for row in trace if row["phase"] in {"CONTACT", "CLOSE"}
+        row
+        for row in trace
+        if row["phase"].startswith("CONTACT") or row["phase"] == "CLOSE"
     ]
     contact_audit_interaction_steps = sum(
         row["interaction_contact_force_n"] > 0.1 for row in contact_audit_rows
@@ -636,12 +711,7 @@ def main() -> None:
             early_abort_reason = "no_finger_contact_after_close"
 
     if early_abort_reason is None and ARGS.joint_plan_npz is not None:
-        arm_indices = [
-            index for index, name in enumerate(franka.dof_names) if name.startswith("panda_joint")
-        ]
-        if len(arm_indices) != 7:
-            raise RuntimeError(f"expected seven Franka arm joints, got {franka.dof_names}")
-        arm_path = values["joint_plan"][:, :7]
+        assert arm_path is not None
         previous = np.asarray(franka.get_joint_positions(), dtype=np.float64)[arm_indices]
         for waypoint in arm_path:
             for alpha in np.linspace(0.0, 1.0, 24, endpoint=True)[1:]:
@@ -739,6 +809,9 @@ def main() -> None:
         "joint_plan_npz": None if ARGS.joint_plan_npz is None else str(ARGS.joint_plan_npz),
         "asset_usd": str(ARGS.asset_usd.resolve()),
         "asset_specific_parameters": False,
+        "asset_translation_m": values["asset_translation"].tolist(),
+        "asset_yaw_rad": float(ARGS.asset_yaw_rad),
+        "robot_translation_m": values["robot_translation"].tolist(),
         "target_dof_name": ARGS.target_dof_name,
         "moving_component_body_paths": component_body_paths,
         "interaction_body_path": interaction_body_path,
@@ -767,6 +840,7 @@ def main() -> None:
         ),
         "contact_stage_audit_enabled": bool(ARGS.abort_after_contact_audit),
         "contact_stage_early_abort_reason": early_abort_reason,
+        "plan_contact_joint_error_rad": plan_contact_joint_error_rad,
         "passive_baseline_drift_fraction": passive_baseline_drift,
         "max_passive_drift_fraction": float(ARGS.max_passive_drift_fraction),
         "passive_baseline_failed": passive_baseline_failed,

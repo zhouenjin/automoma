@@ -8,7 +8,11 @@ from .akr_config import (
     parent_to_child_zero,
 )
 from .contracts import OpenEpisodeAudit, OpenEpisodeContract, OpenEpisodeSample
-from .kinematics import ArticulationSpec, JointConditionedContactPath
+from .kinematics import (
+    ArticulationSpec,
+    graspgen_franka_to_panda_hand_matrix,
+    JointConditionedContactPath,
+)
 from .usd_articulation import (
     OpenJointComponent,
     RealApplianceUsdManifest,
@@ -26,6 +30,7 @@ __all__ = [
     "component_collision_spheres",
     "fit_aabb_spheres",
     "fixed_body_transforms",
+    "graspgen_franka_to_panda_hand_matrix",
     "JointConditionedContactPath",
     "OpenEpisodeAudit",
     "OpenEpisodeContract",

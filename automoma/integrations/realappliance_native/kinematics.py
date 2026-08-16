@@ -17,6 +17,25 @@ def _vector(
     return array
 
 
+def graspgen_franka_to_panda_hand_matrix(matrix: np.ndarray) -> np.ndarray:
+    """Map a GraspGen Franka pose onto the URDF ``panda_hand`` frame.
+
+    GraspGen's canonical antipodal closing axis is local +X; Franka's fingers
+    translate along local +/-Y. Both use local +Z for approach. Therefore the
+    robot-frame pose is the GraspGen pose followed by a -90 degree local-Z
+    rotation.
+    """
+
+    source = np.asarray(matrix, dtype=np.float64)
+    if source.shape != (4, 4):
+        raise ValueError(f"expected a 4x4 pose matrix, got {source.shape}")
+    graspgen_from_panda_hand = np.eye(4, dtype=np.float64)
+    graspgen_from_panda_hand[:3, :3] = Rotation.from_rotvec(
+        np.asarray([0.0, 0.0, -np.pi / 2.0])
+    ).as_matrix()
+    return source @ graspgen_from_panda_hand
+
+
 @dataclass(frozen=True)
 class ArticulationSpec:
     joint_type: str

@@ -11,6 +11,7 @@ from automoma.integrations.realappliance_native import (
     build_akr_robot_config,
     build_open_joint_components,
     choose_open_joint_candidates,
+    graspgen_franka_to_panda_hand_matrix,
 )
 from automoma.integrations.realappliance_native.contracts import (
     require_robot_only_action,
@@ -36,6 +37,13 @@ def test_revolute_contact_follows_the_door_arc() -> None:
     position, _ = path.pose(np.pi / 2)
 
     assert np.allclose(position, [0.0, -1.0, 0.0], atol=1.0e-7)
+
+
+def test_graspgen_franka_closing_axis_maps_to_panda_y() -> None:
+    panda_pose = graspgen_franka_to_panda_hand_matrix(np.eye(4))
+
+    assert np.allclose(panda_pose[:3, 1], [1.0, 0.0, 0.0], atol=1.0e-7)
+    assert np.allclose(panda_pose[:3, 2], [0.0, 0.0, 1.0], atol=1.0e-7)
 
 
 def test_strict_contract_rejects_object_commands_even_when_open() -> None:

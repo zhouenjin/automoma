@@ -14,6 +14,10 @@ import yaml
 import zmq
 from scipy.spatial.transform import Rotation
 
+from automoma.integrations.realappliance_native import (
+    graspgen_franka_to_panda_hand_matrix,
+)
+
 
 msgpack_numpy.patch()
 
@@ -146,18 +150,25 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     candidates = []
     for rank, (score, source, matrix) in enumerate(records):
-        pose = matrix_to_pose(matrix)
-        np.save(args.output_dir / f"{rank:04d}.npy", pose)
+        graspgen_pose = matrix_to_pose(matrix)
+        panda_hand_pose = matrix_to_pose(
+            graspgen_franka_to_panda_hand_matrix(matrix)
+        )
+        np.save(args.output_dir / f"{rank:04d}.npy", panda_hand_pose)
         candidates.append(
             {
                 "rank": rank,
                 "source_component": source,
                 "graspgen_confidence": score,
-                "component_to_gripper_base_pose": pose.tolist(),
+                "component_to_graspgen_gripper_pose": graspgen_pose.tolist(),
+                "component_to_panda_hand_pose": panda_hand_pose.tolist(),
+                # Compatibility field consumed by older native scripts. It now
+                # has the explicit robot-frame convention documented below.
+                "component_to_gripper_base_pose": panda_hand_pose.tolist(),
             }
         )
     metadata = {
-        "schema_version": "automoma.realappliance.graspgen_candidates.v1",
+        "schema_version": "automoma.realappliance.graspgen_candidates.v2",
         "provenance": {
             "pipeline": "automoma_native",
             "g2_inputs_used": False,
@@ -168,6 +179,10 @@ def main() -> None:
             "name": args.gripper_description.stem,
             "width": gripper.get("width"),
             "depth": gripper.get("depth"),
+            "graspgen_closing_axis": "+X",
+            "robot_frame": "panda_hand",
+            "robot_closing_axis": "+/-Y",
+            "graspgen_to_robot_local_rotation": "Rz(-pi/2)",
         },
         "component_cloud": str(args.component_cloud),
         "target_body_paths": list(args.target_body_path),

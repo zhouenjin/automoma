@@ -75,14 +75,17 @@ The executable native path is now:
    and source rigid body;
 5. use the selected handle body as the grasp target and every other component
    body as scene-collision context;
-6. construct a grasp-specific reversed AKR chain from the USD parent/child
+6. convert GraspGen's `+X` closing-axis convention to Franka `panda_hand`'s
+   `+/-Y` finger axis with a fixed local `Rz(-pi/2)` transform, retaining both
+   raw and robot-frame poses in candidate metadata;
+7. construct a grasp-specific reversed AKR chain from the USD parent/child
    anchors and rotations;
-7. inherit AutoMoMa's adjacent-payload collision topology while preserving
+8. inherit AutoMoMa's adjacent-payload collision topology while preserving
    all other robot and component collision checks;
-8. sample the target articulation from closed to the requested fraction, solve
+9. sample the target articulation from closed to the requested fraction, solve
    collision-feasible IK at every sample, and select a continuous path through
    those IK layers;
-9. pass the resulting robot-only path to the physical Isaac executor and audit
+10. pass the resulting robot-only path to the physical Isaac executor and audit
    contact, penetration, object-joint writes, and attachments.
 
 The RealAppliance adapter also performs a pre-episode passive-stability
@@ -101,6 +104,18 @@ step and the run fails the penetration audit if the maximum depth exceeds 5 mm.
 An optional fast audit stops after gripper closing when no finger has touched
 the selected interaction body or when the 5 mm threshold is already exceeded.
 This reduces failed-candidate runtime without relaxing the success definition.
+
+For a planned AKR replay, the final contact and closing phases now converge to
+the first seven Franka coordinates of the cuRobo manifold itself. RMPFlow is
+used only to reach the nearby pre-contact pose. Earlier compatibility runs used
+RMPFlow for the contact pose and switched to the cuRobo joint path only after
+closing; that could execute a different physical grasp than the candidate that
+GraspGen and cuRobo had scored. The executor records the maximum contact-state
+joint tracking error so this handoff is auditable.
+Joint-plan replay also places the Franka base at cuRobo's world origin by
+default. The old heuristic executor offset `(0.10, -0.35, 0)` is retained only
+for non-plan runs; applying it to a cuRobo joint path changes every world-frame
+hand pose despite leaving the joint values unchanged.
 
 The compatibility executor explicitly converts the cuRobo `panda_hand` grasp
 frame into Isaac Sim 4.5 RMPFlow's synthetic `right_gripper` frame. The latter is
