@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -36,7 +37,29 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--g2-root", type=Path, required=True, help="Root of the supplied g2_task_ready package")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--base-distance-weight",
+        type=float,
+        nargs=3,
+        default=(4.0, 4.0, 2.0),
+        metavar=("X", "Y", "YAW"),
+        help="Global soft path cost for planar-base motion; this is not a fixed base-motion share.",
+    )
+    parser.add_argument(
+        "--base-null-space-weight",
+        type=float,
+        nargs=3,
+        default=(2.0, 2.0, 1.0),
+        metavar=("X", "Y", "YAW"),
+        help="Global soft attraction of the planar base toward its retract pose.",
+    )
     args = parser.parse_args()
+    for name, values in (
+        ("base-distance-weight", args.base_distance_weight),
+        ("base-null-space-weight", args.base_null_space_weight),
+    ):
+        if any(not math.isfinite(value) or value <= 0.0 for value in values):
+            raise ValueError(f"{name} values must be finite and positive")
 
     source_urdf = args.g2_root / "assets" / "urdf" / "g2_crsB_swiftpicker_curobo.urdf"
     generated_urdf = args.output_dir / "g2_crsB_swiftpicker_automoma_planar.urdf"
@@ -50,6 +73,11 @@ def main() -> int:
         "mesh_root": str(source_urdf.parent),
         "base_bounds": {"minimum": base_bounds.minimum, "maximum": base_bounds.maximum},
         "base_collision_sphere_count": len(base_collision_spheres),
+        "base_regularization": {
+            "distance_weight": args.base_distance_weight,
+            "null_space_weight": args.base_null_space_weight,
+            "semantics": "global_soft_cost_not_fixed_motion_share",
+        },
         "hands": {},
     }
     for hand in (Hand.LEFT, Hand.RIGHT):
@@ -62,6 +90,8 @@ def main() -> int:
             hand,
             asset_root_path=source_urdf.parent,
             base_collision_spheres=base_collision_spheres,
+            base_distance_weight=args.base_distance_weight,
+            base_null_space_weight=args.base_null_space_weight,
         )
         output_yaml = args.output_dir / f"g2_automoma_{hand.value}.yml"
         output_yaml.parent.mkdir(parents=True, exist_ok=True)

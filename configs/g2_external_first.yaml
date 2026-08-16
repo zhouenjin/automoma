@@ -6,6 +6,9 @@ integration:
   base:
     planner_dofs: [base_x, base_y, base_yaw]
     hard_front_fan: false
+    fixed_motion_share: false
+    distance_weight: [4.0, 4.0, 2.0]
+    null_space_weight: [2.0, 2.0, 1.0]
     seed_standoffs: [0.45, 0.60, 0.75]
     seed_lateral_offsets: [-0.20, 0.0, 0.20]
     seed_yaw_offsets: [-0.20, 0.0, 0.20]
@@ -21,4 +24,3 @@ integration:
     write_target_joint: false
     require_measured_contact: true
     require_penetration_audit: true
-
