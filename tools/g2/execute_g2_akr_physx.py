@@ -35,6 +35,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--friction-multiplier", type=float, default=5.0)
     parser.add_argument("--gripper-effort-multiplier", type=float, default=2.0)
     parser.add_argument("--planner-effort-multiplier", type=float, default=1.5)
+    parser.add_argument("--base-effort-multiplier", type=float, default=1.5)
+    parser.add_argument("--base-position-gain", type=float, default=3.0)
+    parser.add_argument("--base-yaw-gain", type=float, default=1.5)
     parser.add_argument("--maximum-penetration-m", type=float, default=0.003)
     parser.add_argument("--maximum-contact-force-n", type=float, default=250.0)
     parser.add_argument("--camera-distance-multiplier", type=float, default=2.0)
@@ -66,6 +69,10 @@ if ARGS.progress_epsilon_fraction <= 0.0:
     raise ValueError("--progress-epsilon-fraction must be positive")
 if not math.isfinite(ARGS.planner_effort_multiplier) or ARGS.planner_effort_multiplier <= 0.0:
     raise ValueError("--planner-effort-multiplier must be finite and positive")
+if not math.isfinite(ARGS.base_effort_multiplier) or ARGS.base_effort_multiplier <= 0.0:
+    raise ValueError("--base-effort-multiplier must be finite and positive")
+if ARGS.base_position_gain <= 0.0 or ARGS.base_yaw_gain <= 0.0:
+    raise ValueError("base tracking gains must be positive")
 if ARGS.maximum_contact_base_tracking_error_m < ARGS.maximum_base_tracking_error_m:
     raise ValueError("contact-loaded base tolerance must not be smaller than the free-space tolerance")
 APP = SimulationApp({"headless": True, "width": 640, "height": 480, "renderer": "RayTracedLighting"})
@@ -528,6 +535,11 @@ def main() -> int:
     planner_effort = _scale_authored_joint_efforts(
         world.stage, planner_names, ARGS.planner_effort_multiplier,
     )
+    base_effort = _scale_authored_joint_efforts(
+        world.stage,
+        STEERING_JOINT_NAMES + WHEEL_JOINT_NAMES,
+        ARGS.base_effort_multiplier,
+    )
 
     world.reset()
     robot = Articulation("/World/G2/base_link")
@@ -589,6 +601,7 @@ def main() -> int:
     maximum_progress = 0.0
     maximum_off_surface_force = 0.0
     maximum_interaction_lead = 0.0
+    maximum_contact_interaction_lead = 0.0
     phase = "settle"
     step_count = 0
     control_telemetry: dict[str, Any] = {}
@@ -681,7 +694,12 @@ def main() -> int:
             (*_as_numpy(position_raw).reshape(3)[:2], yaw_from_quaternion_wxyz(quaternion_raw))
         )
         base_target = _aligned_base_target(base_plan_start, measured_base_start, reference[:3])
-        twist, base_error, yaw_error = planar_tracking_twist(measured_base, base_target)
+        twist, base_error, yaw_error = planar_tracking_twist(
+            measured_base,
+            base_target,
+            position_gain=ARGS.base_position_gain,
+            yaw_gain=ARGS.base_yaw_gain,
+        )
         current_steering = _as_numpy(robot.get_joint_positions(joint_indices=steering_indices)).reshape(-1)
         steering, wheel = swerve_inverse_kinematics(twist, current_steering_angles_rad=current_steering)
         steering_error = max(
@@ -726,6 +744,8 @@ def main() -> int:
             measured_joint_position=measured_joint_position,
         )
         maximum_interaction_lead = max(maximum_interaction_lead, interaction_lead_m)
+        if selected_contact_now:
+            maximum_contact_interaction_lead = max(maximum_contact_interaction_lead, interaction_lead_m)
         measured_robot_joints = _as_numpy(robot.get_joint_positions(joint_indices=planner_indices)).reshape(-1)
         robot_joint_errors = np.abs(measured_robot_joints - reference[3:-1])
         worst_robot_joint_index = int(np.argmax(robot_joint_errors))
@@ -834,6 +854,7 @@ def main() -> int:
             "maximum_penetration_m": penetration,
             "maximum_off_selected_surface_force_n": maximum_off_surface_force,
             "maximum_interaction_lead_m": maximum_interaction_lead,
+            "maximum_interaction_lead_while_selected_contact_m": maximum_contact_interaction_lead,
             "interaction_lead_limit_m": ARGS.maximum_interaction_lead_m,
             "probe_interaction_lead_limit_m": ARGS.maximum_probe_interaction_lead_m,
             "tracking_limits": {
@@ -846,6 +867,12 @@ def main() -> int:
             "planner_effort": {
                 "multiplier": ARGS.planner_effort_multiplier,
                 "drives": planner_effort,
+            },
+            "base_effort": {
+                "multiplier": ARGS.base_effort_multiplier,
+                "drives": base_effort,
+                "position_gain": ARGS.base_position_gain,
+                "yaw_gain": ARGS.base_yaw_gain,
             },
             "collision_policy": collision_policy,
             "videos": videos,
