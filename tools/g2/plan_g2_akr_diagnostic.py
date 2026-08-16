@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import sys
 import traceback
 from pathlib import Path
@@ -114,13 +113,9 @@ def _nearest_pairs(start: torch.Tensor, goal: torch.Tensor, maximum: int) -> Tup
     return start[start_indices], goal[goal_indices]
 
 
-def _terminal_fk_audit(motion_gen: Any, trajectories: torch.Tensor, success: torch.Tensor) -> Dict[str, float]:
-    successful = torch.nonzero(success.reshape(-1), as_tuple=False).flatten()
-    if successful.numel() == 0:
-        return {"max_position_drift_m": math.inf, "max_rotation_drift_rad": math.inf}
-    selected = trajectories[successful]
-    batch, steps, dof = selected.shape
-    positions = motion_gen.tensor_args.to_device(selected.reshape(batch * steps, dof))
+def _terminal_fk_audit(motion_gen: Any, trajectories: torch.Tensor) -> Dict[str, Any]:
+    batch, steps, dof = trajectories.shape
+    positions = motion_gen.tensor_args.to_device(trajectories.reshape(batch * steps, dof))
     poses = motion_gen.ik_solver.fk(positions).ee_pose
     xyz = poses.position.reshape(batch, steps, 3)
     quaternion = poses.quaternion.reshape(batch, steps, 4)
@@ -129,9 +124,13 @@ def _terminal_fk_audit(motion_gen: Any, trajectories: torch.Tensor, success: tor
     position_drift = torch.linalg.vector_norm(xyz - xyz_reference, dim=-1)
     quaternion_dot = torch.abs(torch.sum(quaternion * quaternion_reference, dim=-1)).clamp(max=1.0)
     rotation_drift = 2.0 * torch.arccos(quaternion_dot)
+    position_per_trajectory = torch.max(position_drift, dim=1).values.detach().cpu()
+    rotation_per_trajectory = torch.max(rotation_drift, dim=1).values.detach().cpu()
     return {
-        "max_position_drift_m": float(torch.max(position_drift).item()),
-        "max_rotation_drift_rad": float(torch.max(rotation_drift).item()),
+        "max_position_drift_m": float(torch.max(position_per_trajectory).item()),
+        "max_rotation_drift_rad": float(torch.max(rotation_per_trajectory).item()),
+        "position_drift_per_trajectory_m": position_per_trajectory.tolist(),
+        "rotation_drift_per_trajectory_rad": rotation_per_trajectory.tolist(),
     }
 
 
@@ -142,8 +141,11 @@ def _plan_augmented_trajectory(
     akr_start: float,
     akr_goal: float,
     maximum_pairs: int,
+    planning_fraction: float,
+    acceptance_fraction: float,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
     from curobo.rollout.rollout_base import Goal
+    from curobo.rollout.cost.pose_cost import PoseCostMetric
     from curobo.types.base import TensorDeviceType
     from curobo.types.robot import JointState
     from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
@@ -170,17 +172,42 @@ def _plan_augmented_trajectory(
     start_state = JointState.from_position(tensor_args.to_device(start))
     goal_state = JointState.from_position(tensor_args.to_device(goal))
     terminal_pose = motion_gen.ik_solver.fk(goal_state.position).ee_pose
+    pose_metric = PoseCostMetric(
+        hold_partial_pose=True,
+        hold_vec_weight=tensor_args.to_device([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
+        offset_tstep_fraction=-1.0,
+    )
+    metric_enabled = motion_gen.update_pose_cost_metric(
+        pose_metric,
+        start_state=start_state,
+        goal_pose=terminal_pose,
+    )
+    if not metric_enabled:
+        raise RuntimeError("cuRobo rejected the full-pose AKR path constraint")
     result = motion_gen.trajopt_solver.solve_batch(
         Goal(goal_pose=terminal_pose, goal_state=goal_state, current_state=start_state)
     )
     trajectories = result.solution.position.detach().clone().cpu()
-    success = result.success.detach().clone().cpu().reshape(-1)
+    trajopt_success = result.success.detach().clone().cpu().reshape(-1)
     if trajectories.ndim == 2:
         trajectories = trajectories.unsqueeze(0)
-    audit = _terminal_fk_audit(motion_gen, trajectories, success)
+    audit = _terminal_fk_audit(motion_gen, trajectories)
+    final_akr = trajectories[:, -1, -1]
+    denominator = akr_goal - akr_start
+    if abs(denominator) < 1e-9:
+        raise ValueError("AKR start and goal positions are identical")
+    achieved_open_fraction = planning_fraction * (final_akr - akr_start) / denominator
+    position_ok = torch.as_tensor(audit["position_drift_per_trajectory_m"]) <= 0.005
+    rotation_ok = torch.as_tensor(audit["rotation_drift_per_trajectory_rad"]) <= 0.05
+    progress_ok = achieved_open_fraction >= acceptance_fraction
+    valid = trajopt_success & position_ok & rotation_ok & progress_ok
     result_report = {
         "pair_count": int(start.shape[0]),
-        "successful_plans": int(success.sum().item()),
+        "trajopt_successful_plans": int(trajopt_success.sum().item()),
+        "valid_akr_plans": int(valid.sum().item()),
+        "achieved_open_fraction_per_trajectory": achieved_open_fraction.tolist(),
+        "planning_fraction": planning_fraction,
+        "acceptance_fraction": acceptance_fraction,
         "status": str(getattr(result, "status", "not_exposed_by_trajopt_result")),
         "terminal_fk_audit": audit,
     }
@@ -188,7 +215,8 @@ def _plan_augmented_trajectory(
         "start_states": start.detach().cpu(),
         "goal_states": goal.detach().cpu(),
         "trajectories": trajectories,
-        "success": success,
+        "trajopt_success": trajopt_success,
+        "success": valid,
     }
     return result_report, tensors
 
@@ -295,10 +323,12 @@ def main() -> int:
                     attachment.akr_position(placed_task.task.initial_position),
                     attachment.akr_position(goal_position),
                     args.max_pairs,
+                    placed_task.task.planning_fraction,
+                    placed_task.task.acceptance_fraction,
                 )
                 torch.save(tensors, attempt_dir / "trajectory.pt")
                 attempt["planning"] = planning_report
-                attempt["success"] = planning_report["successful_plans"] > 0
+                attempt["success"] = planning_report["valid_akr_plans"] > 0
                 attempt["failure_reason"] = None if attempt["success"] else "trajopt_no_success"
             except Exception as error:  # retain the exact failed hypothesis and traceback
                 attempt["failure_reason"] = type(error).__name__
