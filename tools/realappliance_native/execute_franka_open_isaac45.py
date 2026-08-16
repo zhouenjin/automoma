@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -489,5 +490,9 @@ def main() -> None:
 
 try:
     main()
+except BaseException:  # Isaac Sim close may otherwise hide the original traceback.
+    error = traceback.format_exc()
+    print(error, flush=True)
+    (ARGS.output_dir / "error.txt").write_text(error, encoding="utf-8")
 finally:
     SIMULATION_APP.close()
