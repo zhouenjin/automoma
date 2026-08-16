@@ -273,9 +273,19 @@ def build_akr_robot_config(
     buffers[component_link] = 0.0
     kinematics["self_collision_buffer"] = buffers
     ignores = deepcopy(kinematics.get("self_collision_ignore", {}))
-    for values in ignores.values():
+    # Preserve the upstream AutoMoMa payload topology.  The stock
+    # ``attached_object`` is ignored against the adjacent flange/hand/finger
+    # links because their collision spheres overlap at a valid attachment.
+    # Replacing the demo payload must replace those entries rather than delete
+    # them; otherwise every grasp is rejected as a structural self collision.
+    payload_neighbor_links = []
+    for link_name, values in ignores.items():
         if "attached_object" in values:
-            values.remove("attached_object")
+            payload_neighbor_links.append(link_name)
+            values[:] = [
+                component_link if value == "attached_object" else value
+                for value in values
+            ]
     for gripper_link in (ee_link, "panda_leftfinger", "panda_rightfinger"):
         ignores.setdefault(gripper_link, [])
         if component_link not in ignores[gripper_link]:
@@ -301,6 +311,7 @@ def build_akr_robot_config(
             "component_to_ee_pose": list(component_to_ee_pose),
             "akr_target_joint": target_joint_name,
             "source_to_akr_position_sign": -1.0,
+            "payload_self_collision_ignore_links": sorted(set(payload_neighbor_links)),
             "collision_spheres": {
                 component_link: [
                     {"center": [x, y, z], "radius": radius}

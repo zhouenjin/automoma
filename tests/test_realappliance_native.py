@@ -224,7 +224,10 @@ def test_akr_inverts_target_joint_and_keeps_g2_out_of_provenance() -> None:
                 "collision_link_names": ["panda_hand", "attached_object"],
                 "collision_spheres": {},
                 "self_collision_buffer": {"panda_hand": 0.0},
-                "self_collision_ignore": {"panda_hand": []},
+                "self_collision_ignore": {
+                    "panda_link7": ["attached_object"],
+                    "panda_hand": [],
+                },
                 "cspace": {
                     "joint_names": ["panda_joint1"],
                     "retract_config": [0.0],
@@ -254,3 +257,9 @@ def test_akr_inverts_target_joint_and_keeps_g2_out_of_provenance() -> None:
     assert kinematics["cspace"]["joint_names"][-1] == "realappliance_target_joint"
     assert akr["realappliance_native"]["g2_inputs_used"] is False
     assert "attached_object" not in kinematics["extra_links"]
+    assert "realappliance_grasped_component" in kinematics["self_collision_ignore"][
+        "panda_link7"
+    ]
+    assert akr["realappliance_native"]["payload_self_collision_ignore_links"] == [
+        "panda_link7"
+    ]
