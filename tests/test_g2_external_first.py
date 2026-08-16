@@ -20,6 +20,11 @@ from automoma.integrations.realappliance.g2_adapter import (
     fit_bounds_with_spheres,
     make_g2_curobo_config,
 )
+from automoma.integrations.realappliance.g2_runtime import (
+    gripper_targets,
+    planar_tracking_twist,
+    swerve_inverse_kinematics,
+)
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
 from automoma.integrations.realappliance.transform_math import (
     axis_motion_transform,
@@ -300,6 +305,18 @@ def test_automatic_trajectory_selection_uses_global_cspace_metric():
     assert result["ranked_valid_trajectory_indices"] == [1, 0]
     assert result["selected_trajectory_index"] == 1
     assert result["scores_per_trajectory"] == pytest.approx([4.0, np.hypot(1.0, 0.5), np.hypot(0.2, 0.1)])
+
+
+def test_g2_runtime_maps_planar_twist_to_four_swerve_modules():
+    steering, wheel = swerve_inverse_kinematics((0.14, 0.0, 0.0), current_steering_angles_rad=(0.0,) * 4)
+    assert steering == pytest.approx((0.0,) * 4)
+    assert wheel == pytest.approx((2.0,) * 4)
+    twist, position_error, yaw_error = planar_tracking_twist((0.0, 0.0, 0.0), (1.0, 0.0, 0.5))
+    assert twist == pytest.approx((0.15, 0.0, 0.2))
+    assert position_error == pytest.approx(1.0)
+    assert yaw_error == pytest.approx(0.5)
+    assert gripper_targets(0.0) == pytest.approx((0.0,) * 6)
+    assert gripper_targets(1.0) == pytest.approx((-0.85, -0.85, 0.85, 0.85, 0.85, 0.85))
 
 
 @pytest.mark.parametrize(

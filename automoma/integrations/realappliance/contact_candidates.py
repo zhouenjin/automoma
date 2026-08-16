@@ -29,6 +29,9 @@ class ContactCandidate:
     gripper_width: float
     pre_ik_score: float
     automatic_rank: int
+    handle_body_path: str = ""
+    target_moving_body_path: str = ""
+    asset_id_for_reporting_only: str = ""
 
     def validate(self) -> None:
         basis = np.column_stack((self.closing_source, self.gripper_y_source, self.approach_source))
@@ -116,6 +119,9 @@ def _candidate_from_mapping(data: Mapping[str, Any]) -> ContactCandidate:
         gripper_width=float(data["gripper_width_m"]),
         pre_ik_score=float(data.get("pre_ik_score", 0.0)),
         automatic_rank=int(data.get("automatic_pre_ik_rank", 2**31 - 1)),
+        handle_body_path=str(data.get("handle_body_path", "")),
+        target_moving_body_path=str(data.get("target_moving_body_path", "")),
+        asset_id_for_reporting_only=str(data.get("asset_id_for_reporting_only", "")),
     )
     candidate.validate()
     return candidate

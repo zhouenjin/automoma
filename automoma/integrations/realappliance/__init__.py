@@ -16,6 +16,7 @@ from .hypotheses import BasePoseSeed, InteractionHypothesis, generate_interactio
 from .usd_task import ExtractedUsdTask, extract_usd_tasks, resolve_annotated_parts
 from .usd_collision import PlacedCollisionWorld, fixed_body_cluster, load_placed_collision_world
 from .trajectory_selection import weighted_cspace_path_scores
+from .g2_runtime import planner_robot_joint_names, swerve_inverse_kinematics
 
 __all__ = [
     "AkrAttachmentSpec",
@@ -43,6 +44,8 @@ __all__ = [
     "load_placed_collision_world",
     "make_g2_akr_config",
     "make_g2_curobo_config",
+    "planner_robot_joint_names",
     "resolve_annotated_parts",
+    "swerve_inverse_kinematics",
     "weighted_cspace_path_scores",
 ]

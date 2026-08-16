@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""Physically execute one automatically selected G2 AKR opening path.
+
+The target articulation remains passive for the complete episode.  Only G2
+joint drives and the four physical swerve modules receive commands.  This
+first executor gate starts from the planned grasp pose; transit from home and
+release/retreat are intentionally left for the next gate and therefore every
+result remains ``dataset_ready=false``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import subprocess
+import sys
+import traceback
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+from isaacsim import SimulationApp
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--attempt-dir", type=Path, required=True)
+    parser.add_argument("--g2-usd", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--trajectory-index", type=int)
+    parser.add_argument("--physics-hz", type=int, default=120)
+    parser.add_argument("--render-stride", type=int, default=4)
+    parser.add_argument("--friction-multiplier", type=float, default=5.0)
+    parser.add_argument("--gripper-effort-multiplier", type=float, default=2.0)
+    parser.add_argument("--maximum-penetration-m", type=float, default=0.003)
+    parser.add_argument("--maximum-contact-force-n", type=float, default=250.0)
+    parser.add_argument("--camera-distance-multiplier", type=float, default=2.0)
+    parser.add_argument("--maximum-opening-seconds", type=float, default=30.0)
+    return parser.parse_args()
+
+
+ARGS = _parse_args()
+APP = SimulationApp({"headless": True, "width": 640, "height": 480, "renderer": "RayTracedLighting"})
+
+from isaacsim.core.api import World  # noqa: E402
+from isaacsim.core.api.sensors import RigidContactView  # noqa: E402
+from isaacsim.core.prims import Articulation, SingleXFormPrim  # noqa: E402
+from isaacsim.core.utils.stage import add_reference_to_stage  # noqa: E402
+from isaacsim.core.utils.viewports import set_camera_view  # noqa: E402
+from isaacsim.sensors.camera import Camera  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade  # noqa: E402
+import torch  # noqa: E402
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from automoma.integrations.realappliance.contracts import PhysicsRunPolicy  # noqa: E402
+from automoma.integrations.realappliance.g2_adapter import Hand  # noqa: E402
+from automoma.integrations.realappliance.g2_runtime import (  # noqa: E402
+    GRIPPER_JOINT_NAMES,
+    GRIPPER_LINK_GROUPS,
+    STEERING_JOINT_NAMES,
+    WHEEL_JOINT_NAMES,
+    actuator_groups,
+    gripper_targets,
+    named_indices,
+    normalize_angle,
+    planar_tracking_twist,
+    planner_robot_joint_names,
+    swerve_inverse_kinematics,
+    yaw_from_quaternion_wxyz,
+)
+from automoma.integrations.realappliance.transform_math import matrix_to_pose_wxyz  # noqa: E402
+
+
+def _as_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _map_source_path(source_path: str) -> str:
+    if source_path == "/World":
+        return "/World/Appliance"
+    if not source_path.startswith("/World/"):
+        raise ValueError(f"source path is outside /World: {source_path}")
+    return "/World/Appliance/" + source_path[len("/World/"):]
+
+
+def _anchor_body_to_world(stage: Any, body_path: str, anchor_path: str) -> None:
+    prim = stage.GetPrimAtPath(body_path)
+    if not prim.IsValid() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        raise RuntimeError(f"appliance anchor body is not rigid: {body_path}")
+    transform = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+    translation = transform.ExtractTranslation()
+    rotation = transform.ExtractRotationQuat()
+    anchor = UsdPhysics.FixedJoint.Define(stage, anchor_path)
+    anchor.CreateBody1Rel().SetTargets([Sdf.Path(body_path)])
+    anchor.CreateLocalPos0Attr(Gf.Vec3f(*translation))
+    anchor.CreateLocalRot0Attr(Gf.Quatf(float(rotation.GetReal()), Gf.Vec3f(*rotation.GetImaginary())))
+    anchor.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
+    anchor.CreateLocalRot1Attr(Gf.Quatf(1.0, Gf.Vec3f(0.0, 0.0, 0.0)))
+
+
+def _configure_appliance_collision(stage: Any) -> dict[str, Any]:
+    changed = []
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if not path.startswith("/World/Appliance/") or not prim.IsA(UsdGeom.Mesh):
+            continue
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        mesh_api = UsdPhysics.MeshCollisionAPI(prim)
+        source = mesh_api.GetApproximationAttr().Get()
+        if not mesh_api:
+            mesh_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+        mesh_api.CreateApproximationAttr().Set("convexDecomposition")
+        decomposition = PhysxSchema.PhysxConvexDecompositionCollisionAPI.Apply(prim)
+        decomposition.CreateMaxConvexHullsAttr().Set(64)
+        decomposition.CreateVoxelResolutionAttr().Set(500000)
+        decomposition.CreateErrorPercentageAttr().Set(1.0)
+        decomposition.CreateHullVertexLimitAttr().Set(64)
+        decomposition.CreateShrinkWrapAttr().Set(True)
+        changed.append({"path": path, "source": source})
+    if not changed:
+        raise RuntimeError("no appliance collision mesh received the global convex-decomposition policy")
+    return {"policy": "global_convex_decomposition", "collision_disabled": False, "meshes": changed}
+
+
+def _bind_contact_friction(stage: Any, finger_paths: Sequence[str], handle_path: str, multiplier: float) -> dict:
+    material = UsdShade.Material.Define(stage, "/World/ExternalFirstContactMaterial")
+    physics = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    coefficient = 0.5 * float(multiplier)
+    physics.CreateStaticFrictionAttr().Set(coefficient)
+    physics.CreateDynamicFrictionAttr().Set(coefficient)
+    physics.CreateRestitutionAttr().Set(0.0)
+    bound = []
+    for path in sorted(set((*finger_paths, handle_path))):
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            raise RuntimeError(f"friction target prim does not exist: {path}")
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            material, UsdShade.Tokens.strongerThanDescendants, "physics"
+        )
+        bound.append(path)
+    return {"multiplier": float(multiplier), "coefficient": coefficient, "bound_paths": bound}
+
+
+def _contact_audit(view: RigidContactView | None, dt: float) -> dict[str, Any]:
+    if view is None:
+        return {"maximum_force_n": 0.0, "minimum_separation_m": None, "force_by_link_n": {}}
+    matrix_raw = view.get_contact_force_matrix(dt=dt)
+    matrix = np.asarray(matrix_raw, dtype=np.float64) if matrix_raw is not None else np.empty((0,))
+    maximum_force = 0.0 if matrix.size == 0 else float(np.max(np.linalg.norm(matrix, axis=-1)))
+    paths = list(getattr(view, "_prim_paths", []) or [])
+    force_by_link = {}
+    if matrix.size:
+        magnitudes = np.linalg.norm(matrix, axis=-1)
+        if magnitudes.ndim == 1:
+            magnitudes = magnitudes[:, None]
+        for index in range(magnitudes.shape[0]):
+            name = paths[index] if index < len(paths) else f"sensor_{index}"
+            force_by_link[name] = float(np.max(magnitudes[index]))
+    raw = view.get_contact_force_data(dt=dt)
+    minimum_separation = None
+    if raw is not None and len(raw) >= 4:
+        separation = np.asarray(raw[3], dtype=np.float64).reshape(-1)
+        finite = separation[np.isfinite(separation)]
+        if finite.size:
+            minimum_separation = float(np.min(finite))
+    return {
+        "maximum_force_n": maximum_force,
+        "minimum_separation_m": minimum_separation,
+        "force_by_link_n": force_by_link,
+    }
+
+
+def _group_force(audit: dict[str, Any], names: Sequence[str]) -> float:
+    leaves = set(names)
+    return max(
+        (float(force) for path, force in audit["force_by_link_n"].items() if Path(path).name in leaves),
+        default=0.0,
+    )
+
+
+def _sample_trajectory(trajectory: np.ndarray, progress: float) -> np.ndarray:
+    coordinate = float(np.clip(progress, 0.0, 1.0)) * (len(trajectory) - 1)
+    lower = int(math.floor(coordinate))
+    upper = min(lower + 1, len(trajectory) - 1)
+    fraction = coordinate - lower
+    return (1.0 - fraction) * trajectory[lower] + fraction * trajectory[upper]
+
+
+def _aligned_base_target(plan_start: np.ndarray, measured_start: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    yaw_offset = normalize_angle(float(measured_start[2] - plan_start[2]))
+    cosine, sine = math.cos(yaw_offset), math.sin(yaw_offset)
+    rotation = np.asarray(((cosine, -sine), (sine, cosine)))
+    xy = measured_start[:2] + rotation @ (reference[:2] - plan_start[:2])
+    return np.asarray((xy[0], xy[1], normalize_angle(measured_start[2] + reference[2] - plan_start[2])))
+
+
+def _camera_poses(base: np.ndarray, contact: np.ndarray, multiplier: float) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    direction = contact[:2] - base[:2]
+    norm = float(np.linalg.norm(direction))
+    direction = direction / norm if norm > 1.0e-8 else np.asarray((1.0, 0.0))
+    lateral = np.asarray((-direction[1], direction[0]))
+    midpoint = 0.5 * (base + contact)
+    midpoint[2] = max(midpoint[2], contact[2] - 0.25)
+    definitions = {
+        "overview": (midpoint + multiplier * np.asarray((*(-1.4 * direction + 1.2 * lateral), 1.4)), midpoint),
+        "contact": (contact + multiplier * np.asarray((*(-0.45 * direction + 0.70 * lateral), 0.35)), contact),
+        "side": (contact + multiplier * np.asarray((*(-0.25 * direction - 0.85 * lateral), 0.55)), contact),
+    }
+    return {name: (np.asarray(eye), np.asarray(target)) for name, (eye, target) in definitions.items()}
+
+
+class Recorder:
+    def __init__(self, root: Path, cameras: dict[str, Camera], fps: int):
+        self.root = root
+        self.cameras = cameras
+        self.fps = fps
+        self.frame_count = 0
+        for name in (*cameras, "multiview"):
+            (root / "frames" / name).mkdir(parents=True, exist_ok=True)
+
+    def capture(self, telemetry: dict[str, Any]) -> None:
+        images = {}
+        for name, camera in self.cameras.items():
+            rgba = camera.get_rgba()
+            if rgba is None:
+                raise RuntimeError(f"camera returned no frame: {name}")
+            array = np.asarray(rgba)
+            if array.dtype != np.uint8:
+                scale = 255.0 if float(np.max(array, initial=0.0)) <= 1.0 else 1.0
+                array = np.clip(array * scale, 0, 255).astype(np.uint8)
+            image = Image.fromarray(array[..., :3], mode="RGB")
+            image.save(self.root / "frames" / name / f"frame_{self.frame_count:06d}.png")
+            images[name] = image
+        canvas = Image.new("RGB", (1280, 960), (15, 15, 18))
+        positions = {"overview": (0, 0), "contact": (640, 0), "side": (0, 480)}
+        for name, position in positions.items():
+            canvas.paste(images[name].resize((640, 480)), position)
+        draw = ImageDraw.Draw(canvas)
+        draw.text((660, 500), "G2 EXTERNAL-FIRST PHYSX AUDIT", fill=(100, 210, 255))
+        y = 535
+        for key in sorted(telemetry):
+            draw.text((660, y), f"{key}: {telemetry[key]}"[:92], fill=(235, 235, 240))
+            y += 22
+        canvas.save(self.root / "frames" / "multiview" / f"frame_{self.frame_count:06d}.png")
+        with (self.root / "telemetry.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"frame": self.frame_count, **telemetry}, sort_keys=True) + "\n")
+        self.frame_count += 1
+
+    def encode(self) -> dict[str, str]:
+        outputs = {}
+        for name in (*self.cameras, "multiview"):
+            output = self.root / f"{name}.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", str(self.fps),
+                    "-i", str(self.root / "frames" / name / "frame_%06d.png"), "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output),
+                ],
+                check=True,
+            )
+            outputs[name] = str(output)
+        return outputs
+
+
+def _open_limit(task: dict[str, Any]) -> float:
+    initial = float(task["initial_position"])
+    lower = float(task["lower_limit"])
+    upper = float(task["upper_limit"])
+    return upper if abs(upper - initial) >= abs(lower - initial) else lower
+
+
+def _progress(task: dict[str, Any], joint_position: float) -> float:
+    initial = float(task["initial_position"])
+    denominator = _open_limit(task) - initial
+    return float(np.clip((float(joint_position) - initial) / denominator, 0.0, 1.0))
+
+
+def main() -> int:
+    PhysicsRunPolicy().validate()
+    if ARGS.physics_hz <= 0 or ARGS.render_stride <= 0:
+        raise ValueError("physics_hz and render_stride must be positive")
+    ARGS.output_dir.mkdir(parents=True, exist_ok=True)
+    attempt = json.loads((ARGS.attempt_dir / "attempt.json").read_text(encoding="utf-8"))
+    tensors = torch.load(ARGS.attempt_dir / "trajectory.pt", map_location="cpu", weights_only=True)
+    selected = ARGS.trajectory_index
+    if selected is None:
+        selected = attempt["planning"]["automatic_trajectory_selection"]["selected_trajectory_index"]
+    if selected is None or not bool(tensors["success"][int(selected)]):
+        raise ValueError("requested trajectory is not a valid automatically selected AKR path")
+    trajectory = _as_numpy(tensors["trajectories"][int(selected)]).astype(np.float64)
+    hand = Hand(attempt["hand"])
+    task_record = attempt["target_articulation"]
+    task = task_record["task"]
+    dt = 1.0 / ARGS.physics_hz
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "physx_drive_from_planned_contact_pose",
+        "dataset_ready": False,
+        "dataset_ready_blockers": ["home_to_precontact_transit_pending", "release_and_retreat_pending"],
+        "attempt_dir": str(ARGS.attempt_dir.resolve()),
+        "trajectory_index": int(selected),
+        "hand": hand.value,
+        "policy": {
+            "attachment_used": False,
+            "target_collision_disabled": False,
+            "target_joint_written_during_episode": False,
+            "object_set_state_during_episode": False,
+        },
+    }
+
+    world = World(stage_units_in_meters=1.0, physics_dt=dt, rendering_dt=1.0 / 30.0)
+    world.scene.add_default_ground_plane(z_position=-0.04)
+    dome = UsdLux.DomeLight.Define(world.stage, "/World/ExternalFirstDome")
+    dome.CreateIntensityAttr(900.0)
+    light = UsdLux.DistantLight.Define(world.stage, "/World/ExternalFirstKey")
+    light.CreateIntensityAttr(2500.0)
+
+    report = json.loads((ARGS.attempt_dir.parent / "report.json").read_text(encoding="utf-8"))
+    appliance_usd = Path(report["source_usd"])
+    add_reference_to_stage(str(ARGS.g2_usd.resolve()), "/World/G2")
+    add_reference_to_stage(str(appliance_usd), "/World/Appliance")
+    world_from_source = np.asarray(attempt["world_from_source"], dtype=np.float64)
+    appliance_pose = matrix_to_pose_wxyz(world_from_source)
+    SingleXFormPrim("/World/Appliance", name="external_first_appliance").set_world_pose(
+        position=np.asarray(appliance_pose[:3]), orientation=np.asarray(appliance_pose[3:])
+    )
+    base_start = trajectory[0, :3]
+    base_quaternion = np.asarray((math.cos(base_start[2] / 2.0), 0.0, 0.0, math.sin(base_start[2] / 2.0)))
+    SingleXFormPrim("/World/G2", name="external_first_g2").set_world_pose(
+        position=np.asarray((base_start[0], base_start[1], 0.0)), orientation=base_quaternion
+    )
+    collision_policy = _configure_appliance_collision(world.stage)
+    anchor_body = _map_source_path(task_record["body0_path"])
+    _anchor_body_to_world(world.stage, anchor_body, "/World/Appliance/ExternalFirstWorldAnchor")
+
+    handle_path = _map_source_path(attempt["handle_body_source_path"])
+    moving_paths = [_map_source_path(path) for path in attempt["collision_world"]["moving_cluster_paths"]]
+    all_appliance_rigid_paths = sorted(
+        str(prim.GetPath())
+        for prim in world.stage.Traverse()
+        if str(prim.GetPath()).startswith("/World/Appliance/") and prim.HasAPI(UsdPhysics.RigidBodyAPI)
+    )
+    static_paths = [path for path in all_appliance_rigid_paths if path not in moving_paths]
+    finger_names = GRIPPER_LINK_GROUPS[hand]["finger_a"] + GRIPPER_LINK_GROUPS[hand]["finger_b"]
+    finger_paths = [f"/World/G2/{name}" for name in finger_names]
+    friction = _bind_contact_friction(world.stage, finger_paths, handle_path, ARGS.friction_multiplier)
+    target_contact = RigidContactView(
+        prim_paths_expr="/World/G2/*", filter_paths_expr=[handle_path], name="external_first_target_contact",
+        prepare_contact_sensors=True, max_contact_count=8192,
+    )
+    static_contact = RigidContactView(
+        prim_paths_expr="/World/G2/*", filter_paths_expr=static_paths, name="external_first_static_contact",
+        prepare_contact_sensors=True, max_contact_count=16384,
+    ) if static_paths else None
+
+    contact_world = np.asarray(attempt["contact_center_world_m"], dtype=np.float64)
+    camera_definitions = _camera_poses(base_start, contact_world, ARGS.camera_distance_multiplier)
+    cameras = {
+        name: Camera(
+            prim_path=f"/World/ExternalFirst{name.title()}Camera", position=eye, frequency=30, resolution=(640, 480)
+        )
+        for name, (eye, _) in camera_definitions.items()
+    }
+
+    world.reset()
+    robot = Articulation("/World/G2/base_link")
+    robot.initialize()
+    appliance = Articulation("/World/Appliance")
+    appliance.initialize()
+    robot_names = list(robot.dof_names)
+    planner_names = planner_robot_joint_names(hand)
+    planner_indices = named_indices(planner_names, robot_names)
+    gripper_indices = named_indices(GRIPPER_JOINT_NAMES[hand], robot_names)
+    steering_indices = named_indices(STEERING_JOINT_NAMES, robot_names)
+    wheel_indices = named_indices(WHEEL_JOINT_NAMES, robot_names)
+    for group in actuator_groups(hand, gripper_effort_multiplier=ARGS.gripper_effort_multiplier):
+        indices = named_indices(group["names"], robot_names)
+        robot.set_gains(
+            kps=np.asarray(group["kp"], dtype=np.float32).reshape(1, -1),
+            kds=np.asarray(group["kd"], dtype=np.float32).reshape(1, -1),
+            joint_indices=indices,
+        )
+        if "max_effort" in group:
+            robot.set_max_efforts(
+                np.asarray(group["max_effort"], dtype=np.float32).reshape(1, -1), joint_indices=indices
+            )
+    robot.set_joint_positions(trajectory[0, 3:-1].reshape(1, -1), joint_indices=planner_indices)
+    robot.set_joint_positions(gripper_targets(0.0).reshape(1, -1), joint_indices=gripper_indices)
+    robot.set_joint_position_targets(trajectory[0, 3:-1].reshape(1, -1), joint_indices=planner_indices)
+    robot.set_joint_position_targets(gripper_targets(0.0).reshape(1, -1), joint_indices=gripper_indices)
+    robot.set_joint_velocity_targets(np.zeros((1, 4), dtype=np.float32), joint_indices=wheel_indices)
+
+    target_leaf = Path(task_record["joint_path"]).name
+    matching_target_indices = [index for index, name in enumerate(appliance.dof_names) if name == target_leaf]
+    if len(matching_target_indices) != 1:
+        raise RuntimeError(f"could not uniquely resolve target joint {target_leaf!r}: {appliance.dof_names}")
+    target_index = matching_target_indices[0]
+    initial_appliance = _as_numpy(appliance.get_joint_positions()).reshape(-1)
+    initial_appliance[target_index] = float(task["initial_position"])
+    appliance.set_joint_positions(initial_appliance.reshape(1, -1))
+    target_contact.initialize()
+    if static_contact is not None:
+        static_contact.initialize()
+    for name, camera in cameras.items():
+        camera.initialize()
+        camera.set_focal_length(8.0 if name == "overview" else 12.0)
+        eye, target = camera_definitions[name]
+        set_camera_view(eye=eye, target=target, camera_prim_path=camera.prim_path)
+    recorder = Recorder(ARGS.output_dir, cameras, fps=max(1, ARGS.physics_hz // ARGS.render_stride))
+    base_probe = SingleXFormPrim("/World/G2/base_link", name="external_first_base_probe")
+
+    maximum_force = 0.0
+    minimum_separation = 0.0
+    measured_finger_contact = False
+    contact_during_opening = False
+    maximum_progress = 0.0
+    phase = "settle"
+    step_count = 0
+
+    def step_and_record() -> tuple[float, dict[str, Any]]:
+        nonlocal step_count, maximum_force, minimum_separation, measured_finger_contact, maximum_progress
+        world.step(render=(step_count % ARGS.render_stride == 0))
+        target_audit = _contact_audit(target_contact, dt)
+        static_audit = _contact_audit(static_contact, dt)
+        finger_a_force = _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"])
+        finger_b_force = _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"])
+        measured_finger_contact = measured_finger_contact or max(finger_a_force, finger_b_force) >= 0.05
+        force = max(target_audit["maximum_force_n"], static_audit["maximum_force_n"])
+        maximum_force = max(maximum_force, force)
+        separations = [
+            value for value in (target_audit["minimum_separation_m"], static_audit["minimum_separation_m"])
+            if value is not None
+        ]
+        if separations:
+            minimum_separation = min(minimum_separation, min(separations))
+        joint_position = float(_as_numpy(appliance.get_joint_positions()).reshape(-1)[target_index])
+        progress = _progress(task, joint_position)
+        maximum_progress = max(maximum_progress, progress)
+        if step_count % ARGS.render_stride == 0:
+            recorder.capture(
+                {
+                    "phase": phase,
+                    "progress": round(progress, 4),
+                    "finger_a_n": round(finger_a_force, 3),
+                    "finger_b_n": round(finger_b_force, 3),
+                    "maximum_force_n": round(maximum_force, 2),
+                    "minimum_separation_m": round(minimum_separation, 5),
+                }
+            )
+        step_count += 1
+        return progress, {"target": target_audit, "static": static_audit}
+
+    for _ in range(120):
+        robot.set_joint_position_targets(trajectory[0, 3:-1].reshape(1, -1), joint_indices=planner_indices)
+        robot.set_joint_velocity_targets(np.zeros((1, 4), dtype=np.float32), joint_indices=wheel_indices)
+        step_and_record()
+
+    phase = "close"
+    for close_step in range(180):
+        fraction = (close_step + 1) / 180.0
+        robot.set_joint_position_targets(gripper_targets(fraction).reshape(1, -1), joint_indices=gripper_indices)
+        step_and_record()
+    for _ in range(60):
+        robot.set_joint_position_targets(gripper_targets(1.0).reshape(1, -1), joint_indices=gripper_indices)
+        step_and_record()
+
+    phase = "opening"
+    initial_position_raw, initial_quaternion_raw = base_probe.get_world_pose()
+    measured_base_start = np.asarray(
+        (*_as_numpy(initial_position_raw).reshape(3)[:2], yaw_from_quaternion_wxyz(initial_quaternion_raw))
+    )
+    base_plan_start = trajectory[0, :3].copy()
+    base_path = float(np.sum(np.linalg.norm(np.diff(trajectory[:, :2], axis=0), axis=1)))
+    yaw_path = float(np.sum(np.abs(np.diff(trajectory[:, 2]))))
+    robot_path = float(np.max(np.sum(np.abs(np.diff(trajectory[:, 3:-1], axis=0)), axis=0)))
+    duration = max(4.0, 1.5 * base_path / 0.15, 1.5 * yaw_path / 0.2, 1.5 * robot_path / 0.5)
+    duration = min(duration, float(ARGS.maximum_opening_seconds))
+    nominal_steps = max(1, int(math.ceil(duration * ARGS.physics_hz)))
+    reference_progress = 0.0
+    stalled_steps = 0
+    latest_audit: dict[str, Any] = {}
+    for _ in range(nominal_steps + ARGS.physics_hz * 8):
+        reference = _sample_trajectory(trajectory, reference_progress)
+        position_raw, quaternion_raw = base_probe.get_world_pose()
+        measured_base = np.asarray(
+            (*_as_numpy(position_raw).reshape(3)[:2], yaw_from_quaternion_wxyz(quaternion_raw))
+        )
+        base_target = _aligned_base_target(base_plan_start, measured_base_start, reference[:3])
+        twist, base_error, yaw_error = planar_tracking_twist(measured_base, base_target)
+        current_steering = _as_numpy(robot.get_joint_positions(joint_indices=steering_indices)).reshape(-1)
+        steering, wheel = swerve_inverse_kinematics(twist, current_steering_angles_rad=current_steering)
+        steering_error = max(
+            abs(normalize_angle(target - current)) for target, current in zip(steering, current_steering)
+        )
+        wheel *= max(0.0, math.cos(min(math.pi / 2.0, steering_error)))
+        robot.set_joint_position_targets(steering.reshape(1, -1), joint_indices=steering_indices)
+        robot.set_joint_velocity_targets(wheel.reshape(1, -1), joint_indices=wheel_indices)
+        robot.set_joint_position_targets(reference[3:-1].reshape(1, -1), joint_indices=planner_indices)
+        robot.set_joint_position_targets(gripper_targets(1.0).reshape(1, -1), joint_indices=gripper_indices)
+        measured_progress, latest_audit = step_and_record()
+        target_audit = latest_audit["target"]
+        if max(
+            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"]),
+            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
+        ) >= 0.05:
+            contact_during_opening = True
+        if maximum_progress >= float(task["acceptance_fraction"]):
+            break
+        akr_start = trajectory[0, -1]
+        akr_goal = trajectory[-1, -1]
+        expected_progress = float(task["planning_fraction"]) * (reference[-1] - akr_start) / (akr_goal - akr_start)
+        can_advance = (
+            base_error <= 0.04 and yaw_error <= 0.10 and expected_progress <= measured_progress + 0.08
+        )
+        if can_advance and reference_progress < 1.0:
+            reference_progress = min(1.0, reference_progress + 1.0 / nominal_steps)
+            stalled_steps = 0
+        else:
+            stalled_steps += 1
+        if stalled_steps > ARGS.physics_hz * 8:
+            break
+
+    robot.set_joint_velocity_targets(np.zeros((1, 4), dtype=np.float32), joint_indices=wheel_indices)
+    phase = "final_hold"
+    for _ in range(60):
+        step_and_record()
+    videos = recorder.encode()
+    penetration = max(0.0, -minimum_separation)
+    strict_success = bool(
+        maximum_progress >= float(task["acceptance_fraction"])
+        and contact_during_opening
+        and penetration <= ARGS.maximum_penetration_m
+        and maximum_force <= ARGS.maximum_contact_force_n
+    )
+    result.update(
+        {
+            "strict_physical_open_success": strict_success,
+            "maximum_progress_fraction": maximum_progress,
+            "acceptance_fraction": float(task["acceptance_fraction"]),
+            "measured_finger_contact": measured_finger_contact,
+            "contact_during_opening": contact_during_opening,
+            "maximum_contact_force_n": maximum_force,
+            "minimum_contact_separation_m": minimum_separation,
+            "maximum_penetration_m": penetration,
+            "friction": friction,
+            "collision_policy": collision_policy,
+            "videos": videos,
+            "step_count": step_count,
+            "failure_reason": None if strict_success else "strict_physical_contract_not_met",
+        }
+    )
+    (ARGS.output_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    return 0 if strict_success else 1
+
+
+if __name__ == "__main__":
+    exit_code = 2
+    try:
+        exit_code = main()
+    except Exception as error:
+        ARGS.output_dir.mkdir(parents=True, exist_ok=True)
+        (ARGS.output_dir / "traceback.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        (ARGS.output_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "mode": "physx_drive_from_planned_contact_pose",
+                    "dataset_ready": False,
+                    "strict_physical_open_success": False,
+                    "failure_reason": type(error).__name__,
+                    "failure_message": str(error),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        APP.close()
+    raise SystemExit(exit_code)

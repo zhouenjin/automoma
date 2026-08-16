@@ -37,6 +37,7 @@ from automoma.integrations.realappliance.transform_math import (  # noqa: E402
     axis_motion_transform,
     invert_rigid,
     rotation_matrix_to_quaternion_wxyz,
+    transform_point,
 )
 from automoma.integrations.realappliance.usd_task import ExtractedUsdTask, extract_usd_tasks  # noqa: E402
 from automoma.integrations.realappliance.usd_collision import (  # noqa: E402
@@ -323,6 +324,10 @@ def main() -> int:
                 "attempt_id": attempt_id,
                 "hypothesis_id": candidate.hypothesis_id,
                 "automatic_rank": candidate.automatic_rank,
+                "pre_ik_score": candidate.pre_ik_score,
+                "handle_body_source_path": candidate.handle_body_path,
+                "target_moving_body_source_path": candidate.target_moving_body_path,
+                "asset_id_for_reporting_only": candidate.asset_id_for_reporting_only,
                 "hand": hand.value,
                 "capture_depth_fraction": depth_fraction,
                 "success": False,
@@ -334,6 +339,20 @@ def main() -> int:
                     capture_depth_fraction=depth_fraction,
                 )
                 placed_task = task.placed(placed.world_from_source)
+                attempt["target_articulation"] = placed_task.to_dict()
+                attempt["target_articulation"]["task"].update(
+                    {
+                        "planning_fraction": placed_task.task.planning_fraction,
+                        "acceptance_fraction": placed_task.task.acceptance_fraction,
+                        "open_limit": placed_task.task.open_limit,
+                    }
+                )
+                attempt["contact_center_world_m"] = transform_point(
+                    placed.world_from_source, candidate.contact_center_source
+                )
+                attempt["contact_points_world_m"] = [
+                    transform_point(placed.world_from_source, point) for point in candidate.contact_points_source
+                ]
                 collision_world = load_placed_collision_world(
                     source_usd,
                     placed.world_from_source,
