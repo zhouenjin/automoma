@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from curobo.geom.types import Cuboid, WorldConfig
+from curobo.geom.types import Cuboid, Mesh, WorldConfig
 from curobo.rollout.rollout_base import Goal
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ik-seeds", type=int, default=2048)
     parser.add_argument("--manifold-waypoints", type=int, default=32)
     parser.add_argument("--manifold-ik-seeds", type=int, default=256)
+    parser.add_argument("--precontact-distance-m", type=float, default=0.12)
+    parser.add_argument("--transit-obstacle-padding-m", type=float, default=0.005)
+    parser.add_argument("--static-mesh-pitch-m", type=float, default=0.01)
     parser.add_argument("--staging-center", type=float, nargs=3, default=(0.75, 0.0, 0.8))
     parser.add_argument("--staging-yaw-rad", type=float, default=0.0)
     parser.add_argument("--output", type=Path, required=True)
@@ -69,15 +72,23 @@ def clean_base_config(config: dict) -> dict:
     return config
 
 
-def motion_gen(robot_cfg: dict, tensor_args: TensorDeviceType, *, seeds: int) -> MotionGen:
+def motion_gen(
+    robot_cfg: dict,
+    tensor_args: TensorDeviceType,
+    *,
+    seeds: int,
+    world: WorldConfig | None = None,
+) -> MotionGen:
     sentinel = Cuboid(
         name="empty_world_sentinel",
         pose=[100.0, 100.0, 100.0, 1.0, 0.0, 0.0, 0.0],
         dims=[0.1, 0.1, 0.1],
     )
+    if world is None or (not world.cuboid and not world.mesh):
+        world = WorldConfig(cuboid=[sentinel])
     config = MotionGenConfig.load_from_robot_config(
         robot_cfg,
-        WorldConfig(cuboid=[sentinel]),
+        world,
         tensor_args,
         num_ik_seeds=seeds,
         num_trajopt_seeds=12,
@@ -178,6 +189,111 @@ def select_continuous_path(layers: list[torch.Tensor], retract: torch.Tensor) ->
     return torch.stack([layer[index] for layer, index in zip(layers, indices)])
 
 
+def cloud_obstacle_cuboids(
+    cloud,
+    component_to_world: np.ndarray,
+    padding_m: float,
+    *,
+    points_key: str,
+    body_index_key: str,
+    body_paths_key: str,
+    name_prefix: str,
+) -> list[Cuboid]:
+    """Build generic oriented body boxes from a component-frame point cloud."""
+
+    if points_key not in cloud.files:
+        return []
+    points = np.asarray(cloud[points_key], dtype=np.float64)
+    body_index = np.asarray(cloud[body_index_key], dtype=np.int64)
+    body_paths = [str(value) for value in cloud[body_paths_key]]
+    quaternion_xyzw = Rotation.from_matrix(component_to_world[:3, :3]).as_quat()
+    quaternion_wxyz = np.roll(quaternion_xyzw, 1).tolist()
+    cuboids = []
+    for index, _body_path in enumerate(body_paths):
+        body_points = points[body_index == index]
+        if len(body_points) == 0:
+            continue
+        lower = body_points.min(axis=0)
+        upper = body_points.max(axis=0)
+        center_component = 0.5 * (lower + upper)
+        center_world = (
+            component_to_world
+            @ np.asarray([*center_component.tolist(), 1.0], dtype=np.float64)
+        )[:3]
+        dims = np.maximum(upper - lower + 2.0 * padding_m, 0.002)
+        cuboids.append(
+            Cuboid(
+                name=f"{name_prefix}_{index}",
+                pose=[*center_world.tolist(), *quaternion_wxyz],
+                dims=dims.tolist(),
+            )
+        )
+    return cuboids
+
+
+def component_obstacle_cuboids(
+    cloud,
+    component_to_world: np.ndarray,
+    padding_m: float,
+) -> list[Cuboid]:
+    return cloud_obstacle_cuboids(
+        cloud,
+        component_to_world,
+        padding_m,
+        points_key="points_component_m",
+        body_index_key="body_index",
+        body_paths_key="body_paths",
+        name_prefix="transit_component_body",
+    )
+
+
+def static_obstacle_cuboids(
+    cloud,
+    component_to_world: np.ndarray,
+    padding_m: float,
+) -> list[Cuboid]:
+    return cloud_obstacle_cuboids(
+        cloud,
+        component_to_world,
+        padding_m,
+        points_key="scene_points_component_m",
+        body_index_key="scene_body_index",
+        body_paths_key="scene_body_paths",
+        name_prefix="static_appliance_body",
+    )
+
+
+def static_obstacle_meshes(
+    cloud,
+    component_to_world: np.ndarray,
+    pitch_m: float,
+) -> list[Mesh]:
+    """Reconstruct per-body surface meshes without sealing appliance openings."""
+
+    if "scene_points_component_m" not in cloud.files:
+        return []
+    points = np.asarray(cloud["scene_points_component_m"], dtype=np.float64)
+    body_index = np.asarray(cloud["scene_body_index"], dtype=np.int64)
+    body_paths = [str(value) for value in cloud["scene_body_paths"]]
+    quaternion_wxyz = np.roll(
+        Rotation.from_matrix(component_to_world[:3, :3]).as_quat(), 1
+    ).tolist()
+    meshes = []
+    for index, _body_path in enumerate(body_paths):
+        body_points = points[body_index == index]
+        if len(body_points) == 0:
+            continue
+        meshes.append(
+            Mesh.from_pointcloud(
+                body_points,
+                pitch=pitch_m,
+                name=f"static_appliance_mesh_{index}",
+                pose=[*component_to_world[:3, 3].tolist(), *quaternion_wxyz],
+            )
+        )
+    return meshes
+
+
 def main() -> None:
     args = parse_args()
     if not 0.0 < args.target_fraction <= 1.0:
@@ -242,7 +358,15 @@ def main() -> None:
 
     tensor_args = TensorDeviceType()
     base_cfg = clean_base_config(load_yaml(str(args.base_robot_config))["robot_cfg"])
-    base_mg = motion_gen(base_cfg, tensor_args, seeds=args.ik_seeds)
+    static_obstacles = static_obstacle_meshes(
+        cloud,
+        component_to_world,
+        float(args.static_mesh_pitch_m),
+    )
+    static_world = WorldConfig(mesh=static_obstacles)
+    base_mg = motion_gen(
+        base_cfg, tensor_args, seeds=args.ik_seeds, world=static_world
+    )
     retract = tensor_args.to_device(base_cfg["kinematics"]["cspace"]["retract_config"])
     start_iks = solve_ik(base_mg, pose_list(start_ee), retract, args.ik_seeds)
     goal_iks = solve_ik(base_mg, pose_list(goal_ee), retract, args.ik_seeds)
@@ -260,7 +384,12 @@ def main() -> None:
 
     akr_raw = load_yaml(str(args.akr_config))
     akr_cfg = akr_raw["robot_cfg"]
-    akr_mg = motion_gen(akr_cfg, tensor_args, seeds=min(args.ik_seeds, 512))
+    akr_mg = motion_gen(
+        akr_cfg,
+        tensor_args,
+        seeds=min(args.ik_seeds, 512),
+        world=static_world,
+    )
 
     manifold_layers = []
     manifold_layer_counts = []
@@ -368,6 +497,37 @@ def main() -> None:
         anchor_rotation_error.append(rot_error)
         valid.append(bool(success[index]) and pos_error <= 0.01 and rot_error <= 0.05)
 
+    precontact_ee = start_ee.copy()
+    precontact_ee[:3, 3] -= (
+        start_ee[:3, 2] * float(args.precontact_distance_m)
+    )
+    transit_world = WorldConfig(
+        cuboid=[
+            *component_obstacle_cuboids(
+                cloud,
+                component_to_world,
+                float(args.transit_obstacle_padding_m),
+            ),
+        ],
+        mesh=static_obstacles,
+    )
+    base_mg.update_world(transit_world)
+    # The YAML c-space also lists two locked finger coordinates, whereas
+    # MotionGen exposes only the seven active arm coordinates for planning.
+    retract_state = JointState.from_position(
+        base_mg.get_retract_config().unsqueeze(0)
+    )
+    transit_result = base_mg.plan_single(
+        retract_state,
+        Pose.from_list(pose_list(precontact_ee)),
+    )
+    transit_success = bool(transit_result.success.item())
+    transit_path = (
+        np.empty((0, 7), dtype=np.float32)
+        if not transit_success or transit_result.optimized_plan is None
+        else tensor_to_numpy(transit_result.optimized_plan.position)
+    )
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         args.output,
@@ -406,7 +566,13 @@ def main() -> None:
         anchor_position_error_m=np.asarray(anchor_position_error),
         anchor_rotation_error_rad=np.asarray(anchor_rotation_error),
         start_ee_pose=np.asarray(pose_list(start_ee)),
+        precontact_ee_pose=np.asarray(pose_list(precontact_ee)),
         goal_ee_pose=np.asarray(pose_list(goal_ee)),
+        transit_path=transit_path,
+        transit_success=np.asarray(transit_success),
+        transit_obstacle_count=np.asarray(len(transit_world.cuboid or [])),
+        static_obstacle_count=np.asarray(len(static_obstacles)),
+        static_obstacle_representation=np.asarray("pointcloud_marching_cubes"),
     )
     report = {
         "schema_version": "automoma.realappliance.akr_smoke.v1",
@@ -444,6 +610,12 @@ def main() -> None:
         "manifold_anchor_rotation_error_rad": manifold_anchor_rotation_error,
         "manifold_constraint_metrics": metric_summary(manifold_constraint_metrics),
         "anchor_valid_count": int(np.asarray(valid).sum()),
+        "transit_success": transit_success,
+        "transit_waypoint_count": int(len(transit_path)),
+        "transit_obstacle_count": len(transit_world.cuboid or []),
+        "static_obstacle_count": len(static_obstacles),
+        "static_obstacle_representation": "pointcloud_marching_cubes",
+        "static_mesh_pitch_m": args.static_mesh_pitch_m,
         "strict_physical_success": False,
         "strict_physical_pending": True,
         "output": str(args.output),

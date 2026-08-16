@@ -147,7 +147,12 @@ def export() -> dict[str, object]:
         dtype=np.float64,
     ) * manifest.meters_per_unit
     rigid_body_set = set(manifest.rigid_body_paths)
-    body_to_triangles: dict[str, list[np.ndarray]] = {body: [] for body in component.rigid_bodies}
+    # Sample every rigid body in the appliance in the movable-component frame.
+    # The target component is used for GraspGen inference; the remaining bodies
+    # are retained as collision context for grasp filtering, IK, and transit.
+    body_to_triangles: dict[str, list[np.ndarray]] = {
+        body: [] for body in manifest.rigid_body_paths
+    }
     for prim in stage.Traverse():
         if not prim.IsA(UsdGeom.Mesh):
             continue
@@ -162,23 +167,54 @@ def export() -> dict[str, object]:
             body_to_triangles[owner_path].append(triangles)
 
     rng = np.random.default_rng(ARGS.seed)
-    point_blocks = []
-    normal_blocks = []
-    body_indices = []
-    exported_bodies = []
-    for body_path, blocks in body_to_triangles.items():
-        if not blocks:
-            continue
-        points, normals = sample_triangles(
-            np.concatenate(blocks, axis=0), ARGS.points_per_body, rng
-        )
-        body_index = len(exported_bodies)
-        exported_bodies.append(body_path)
-        point_blocks.append(points)
-        normal_blocks.append(normals)
-        body_indices.append(np.full(len(points), body_index, dtype=np.int32))
+    def sample_bodies(body_paths: tuple[str, ...] | list[str]):
+        point_blocks = []
+        normal_blocks = []
+        body_indices = []
+        exported_bodies = []
+        for body_path in body_paths:
+            blocks = body_to_triangles.get(body_path, [])
+            if not blocks:
+                continue
+            points, normals = sample_triangles(
+                np.concatenate(blocks, axis=0), ARGS.points_per_body, rng
+            )
+            body_index = len(exported_bodies)
+            exported_bodies.append(body_path)
+            point_blocks.append(points)
+            normal_blocks.append(normals)
+            body_indices.append(np.full(len(points), body_index, dtype=np.int32))
+        return point_blocks, normal_blocks, body_indices, exported_bodies
+
+    point_blocks, normal_blocks, body_indices, exported_bodies = sample_bodies(
+        component.rigid_bodies
+    )
     if not point_blocks:
         raise RuntimeError("selected component contains no triangle geometry")
+    static_body_paths = [
+        path for path in manifest.rigid_body_paths if path not in component.rigid_bodies
+    ]
+    (
+        scene_point_blocks,
+        scene_normal_blocks,
+        scene_body_indices,
+        scene_exported_bodies,
+    ) = sample_bodies(static_body_paths)
+    scene_points = (
+        np.concatenate(scene_point_blocks)
+        if scene_point_blocks
+        else np.empty((0, 3), dtype=np.float32)
+    )
+    scene_normals = (
+        np.concatenate(scene_normal_blocks)
+        if scene_normal_blocks
+        else np.empty((0, 3), dtype=np.float32)
+    )
+    scene_indices = (
+        np.concatenate(scene_body_indices)
+        if scene_body_indices
+        else np.empty((0,), dtype=np.int32)
+    )
     ARGS.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         ARGS.output,
@@ -186,6 +222,10 @@ def export() -> dict[str, object]:
         normals_component=np.concatenate(normal_blocks),
         body_index=np.concatenate(body_indices),
         body_paths=np.asarray(exported_bodies),
+        scene_points_component_m=scene_points,
+        scene_normals_component=scene_normals,
+        scene_body_index=scene_indices,
+        scene_body_paths=np.asarray(scene_exported_bodies),
         joint_path=np.asarray(component.joint.path),
         component_body_path=np.asarray(component.joint.child_body),
         component_to_world=component_to_world.astype(np.float32),
@@ -200,7 +240,9 @@ def export() -> dict[str, object]:
         "joint_path": component.joint.path,
         "component_body_path": component.joint.child_body,
         "body_paths": exported_bodies,
+        "scene_body_paths": scene_exported_bodies,
         "point_count": int(sum(len(value) for value in point_blocks)),
+        "scene_point_count": int(len(scene_points)),
         "component_to_world": component_to_world.tolist(),
         "joint_axis_world": axis_world.tolist(),
         "joint_pivot_world_m": pivot_world.tolist(),

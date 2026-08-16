@@ -105,9 +105,11 @@ An optional fast audit stops after gripper closing when no finger has touched
 the selected interaction body or when the 5 mm threshold is already exceeded.
 This reduces failed-candidate runtime without relaxing the success definition.
 
-For a planned AKR replay, the final contact and closing phases now converge to
-the first seven Franka coordinates of the cuRobo manifold itself. RMPFlow is
-used only to reach the nearby pre-contact pose. Earlier compatibility runs used
+For a planned AKR replay, home-to-precontact is now a full cuRobo motion plan and
+the contact and closing phases converge to the first seven Franka coordinates of
+the cuRobo manifold itself. The executor records and replays the 7-DOF transit
+path instead of asking RMPFlow to approach through an unchecked workspace.
+Earlier compatibility runs used
 RMPFlow for the contact pose and switched to the cuRobo joint path only after
 closing; that could execute a different physical grasp than the candidate that
 GraspGen and cuRobo had scored. The executor records the maximum contact-state
@@ -170,6 +172,51 @@ GraspGen's official point-cloud scene collision filter before IK. In the first
 `055` rerun, `33/200` handle grasps survived a `3 mm` threshold; the rejected
 167 candidates no longer consume AKR or PhysX budget.
 
+### Full-appliance collision-world correction
+
+The first transit-enabled replay exposed a second, independent collision-world
+gap. With the appliance staged too close to the retract pose, the robot already
+overlapped the appliance before motion. Moving the appliance farther away reduced
+passive opening to `0.16%`, but the selected contact state still missed the
+handle. The new execution diagnostics localized the miss:
+
+- planned `panda_joint1`: `-0.05750 rad`;
+- measured `panda_joint1` after contact and close: `+0.06491 rad`;
+- maximum error among the other six arm joints: below `0.004 rad`;
+- planned-to-measured `panda_hand` translation error: `76.12 mm`;
+- measured finger/handle, hand/appliance, and wrist/appliance contact: zero in
+  the dedicated contact views;
+- final door progress: `2.64%`, therefore a strict failure.
+
+The multiview replay shows the proximal arm being blocked by the appliance body
+while cuRobo had accepted the pose. The reason was structural: the old component
+cloud contained only the moving door and fixed handle descendants. Static casing
+bodies were absent from GraspGen scene filtering, endpoint IK, the AKR manifold,
+and transit planning.
+
+The native input contract now exports two disjoint geometry sets in the movable
+component frame:
+
+- `points_component_m`: moving door/handle geometry used for grasp inference;
+- `scene_points_component_m`: every non-component rigid body in the appliance,
+  used only as collision context.
+
+For asset `055` this is 16,384 target points over two rigid bodies plus 49,152
+static points over six rigid bodies. GraspGen's official collision filter now
+sees both adjacent moving geometry and the full static appliance. Dense scene
+filtering uses a bounded GPU chunk size to avoid the official `torch.cdist`
+implementation allocating over 13 GiB per batch. At a 3 mm clearance no new
+candidate survived; at 1 mm, 22/200 survived and were retained for downstream
+testing rather than relaxing collision checks entirely.
+
+cuRobo receives per-static-body marching-cubes meshes reconstructed from this
+point cloud. One OBB per rigid body was tested and rejected because it sealed
+valid gaps near the handle even with zero padding. Static meshes are used for
+closed/open endpoint IK and every articulation sample; the transit world adds
+the moving component as a separate obstacle. The automatic staging search now
+updates this full collision world once per staging pose and then evaluates all
+candidates, rather than ranking raw IK in an empty appliance world.
+
 ## Paper-version reproducibility
 
 The paper stack is being retained separately from the Isaac Sim 4.5
@@ -198,4 +245,3 @@ so exact-source retention and Isaac 4.5 compatibility execution remain separate.
 No strict native success exists yet. `strict_physical_success` remains false
 until Isaac/PhysX executes robot DOFs only and the contact and penetration
 audits pass; planner feasibility alone is never promoted to dataset-ready data.
-metrics.

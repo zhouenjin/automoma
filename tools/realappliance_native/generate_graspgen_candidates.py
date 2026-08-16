@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--filter-scene-collisions", action="store_true")
     parser.add_argument("--collision-threshold-m", type=float, default=0.003)
     parser.add_argument("--collision-samples", type=int, default=4000)
+    parser.add_argument(
+        "--collision-batch-size",
+        type=int,
+        default=2,
+        help="Grasps per GPU cdist chunk; lower this for dense full-appliance clouds.",
+    )
     return parser.parse_args()
 
 
@@ -66,6 +72,11 @@ def main() -> None:
     points = np.asarray(cloud["points_component_m"], dtype=np.float32)
     body_index = np.asarray(cloud["body_index"], dtype=np.int32)
     body_paths = [str(value) for value in cloud["body_paths"]]
+    static_scene_points = (
+        np.asarray(cloud["scene_points_component_m"], dtype=np.float32)
+        if "scene_points_component_m" in cloud.files
+        else np.empty((0, 3), dtype=np.float32)
+    )
     gripper = yaml.safe_load(args.gripper_description.read_text(encoding="utf-8"))
 
     context = zmq.Context()
@@ -80,13 +91,15 @@ def main() -> None:
     if unknown_paths:
         raise RuntimeError(f"target bodies are absent from cloud: {sorted(unknown_paths)}")
 
-    inputs = [] if selected_paths else [("component", points, np.empty((0, 3)))]
+    inputs = [] if selected_paths else [("component", points, static_scene_points)]
     for index, body_path in enumerate(body_paths):
         body_points = points[body_index == index]
         if selected_paths and body_path not in selected_paths:
             continue
         if len(body_points) >= args.minimum_body_points:
-            scene_points = points[body_index != index]
+            scene_points = np.concatenate(
+                [points[body_index != index], static_scene_points], axis=0
+            )
             inputs.append((body_path, body_points, scene_points))
     if not inputs:
         raise RuntimeError("no interaction body has enough points for inference")
@@ -131,6 +144,7 @@ def main() -> None:
                 grasp_poses=poses,
                 collision_threshold=args.collision_threshold_m,
                 gripper_surface_points=gripper_surface_points,
+                batch_size=args.collision_batch_size,
             )
             poses = poses[keep]
             confidence = confidence[keep]
@@ -190,6 +204,7 @@ def main() -> None:
             "enabled": bool(args.filter_scene_collisions),
             "threshold_m": args.collision_threshold_m,
             "surface_samples": args.collision_samples,
+            "batch_size": args.collision_batch_size,
             "statistics": collision_statistics,
         },
         "candidate_count": len(candidates),

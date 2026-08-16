@@ -175,6 +175,15 @@ def parse_inputs() -> dict[str, np.ndarray]:
             raise ValueError(f"expected a fixed-Franka 8D manifold path, got {path.shape}")
         if start_pose.shape != (7,):
             raise ValueError(f"expected a 7D start EE pose, got {start_pose.shape}")
+        transit_path = (
+            np.asarray(plan["transit_path"], dtype=np.float64)
+            if "transit_path" in plan.files
+            else np.empty((0, 7), dtype=np.float64)
+        )
+        if transit_path.ndim != 2 or transit_path.shape[1] != 7:
+            raise ValueError(
+                f"expected a 7D transit path, got {transit_path.shape}"
+            )
         hand_rotation = Rotation.from_quat(np.roll(start_pose[3:], -1))
         orientation = hand_rotation.as_matrix()
         # cuRobo plans panda_hand, whereas Isaac Sim 4.5 RMPFlow controls the
@@ -187,7 +196,9 @@ def parse_inputs() -> dict[str, np.ndarray]:
             np.asarray([0.0, 0.0, 0.1])
         )
         values["joint_plan"] = path
+        values["transit_path"] = transit_path
         values["hand_contact_world"] = start_pose[:3]
+        values["hand_contact_orientation"] = start_pose[3:]
         values["contact_world"] = right_gripper_position
         values["contact_orientation"] = np.roll(
             right_gripper_rotation.as_quat(), 1
@@ -385,12 +396,31 @@ def main() -> None:
         prepare_contact_sensors=True,
         max_contact_count=1024,
     )
+    hand_contacts = RigidContactView(
+        prim_paths_expr="/World/Franka/panda_hand",
+        filter_paths_expr=component_body_paths,
+        name="native_hand_target_contacts",
+        prepare_contact_sensors=True,
+        max_contact_count=1024,
+    )
+    wrist_contacts = RigidContactView(
+        prim_paths_expr="/World/Franka/panda_link7",
+        filter_paths_expr=component_body_paths,
+        name="native_wrist_target_contacts",
+        prepare_contact_sensors=True,
+        max_contact_count=1024,
+    )
 
     world.reset()
     appliance = Articulation("/World/Appliance")
     appliance.initialize()
     target_contacts.initialize()
     interaction_contacts.initialize()
+    hand_contacts.initialize()
+    wrist_contacts.initialize()
+    hand_xform = SingleXFormPrim(
+        "/World/Franka/panda_hand", name="native_open_franka_hand_xform"
+    )
     target_matches = [
         index
         for index, name in enumerate(appliance.dof_names)
@@ -557,6 +587,13 @@ def main() -> None:
         array = np.asarray(matrix, dtype=np.float64)
         return 0.0 if not array.size else float(np.max(np.linalg.norm(array, axis=-1)))
 
+    def contact_view_force(view: RigidContactView) -> float:
+        matrix = view.get_contact_force_matrix(dt=1.0 / 120.0)
+        if matrix is None:
+            return 0.0
+        array = np.asarray(matrix, dtype=np.float64)
+        return 0.0 if not array.size else float(np.max(np.linalg.norm(array, axis=-1)))
+
     def interaction_contact_force() -> float:
         matrix = interaction_contacts.get_contact_force_matrix(dt=1.0 / 120.0)
         if matrix is None:
@@ -584,6 +621,8 @@ def main() -> None:
         measured_joint, progress = measured_progress()
         force = target_contact_force()
         interaction_force = interaction_contact_force()
+        hand_force = contact_view_force(hand_contacts)
+        wrist_force = contact_view_force(wrist_contacts)
         minimum_separation = minimum_contact_separation()
         trace.append(
             {
@@ -593,6 +632,8 @@ def main() -> None:
                 "range_fraction": progress,
                 "target_contact_force_n": force,
                 "interaction_contact_force_n": interaction_force,
+                "hand_contact_force_n": hand_force,
+                "wrist_contact_force_n": wrist_force,
                 "minimum_contact_separation_m": minimum_separation,
                 "maximum_contact_penetration_m": (
                     0.0 if minimum_separation is None else max(0.0, -minimum_separation)
@@ -668,7 +709,13 @@ def main() -> None:
         record_step("PASSIVE_BASELINE", render)
     _, passive_baseline_drift = measured_progress()
 
-    step_pose("PRECONTACT", precontact_world, orientation, 300, 0.04)
+    transit_path = values.get("transit_path")
+    transit_path_used = transit_path is not None and len(transit_path) > 0
+    if transit_path_used:
+        for waypoint in transit_path:
+            step_arm_target("TRANSIT_PLAN", waypoint, 12, 0.04)
+    else:
+        step_pose("PRECONTACT", precontact_world, orientation, 300, 0.04)
     if arm_path is None:
         step_pose("CONTACT", contact_world, orientation, 180, 0.04)
         step_pose("CLOSE", contact_world, orientation, 180, 0.0)
@@ -682,12 +729,33 @@ def main() -> None:
         step_arm_target("CLOSE", arm_path[0], 180, 0.0)
 
     plan_contact_joint_error_rad: float | None = None
+    measured_contact_arm_joints: list[float] | None = None
+    measured_contact_hand_position_m: list[float] | None = None
+    measured_contact_hand_orientation_wxyz: list[float] | None = None
+    plan_contact_hand_position_error_m: float | None = None
+    plan_contact_hand_rotation_error_rad: float | None = None
     if arm_path is not None:
         measured_arm = np.asarray(
             franka.get_joint_positions(), dtype=np.float64
         )[arm_indices]
+        measured_contact_arm_joints = measured_arm.tolist()
         plan_contact_joint_error_rad = float(
             np.max(np.abs(measured_arm - arm_path[0]))
+        )
+        hand_position, hand_orientation = hand_xform.get_world_pose()
+        hand_position = np.asarray(hand_position, dtype=np.float64)
+        hand_orientation = np.asarray(hand_orientation, dtype=np.float64)
+        measured_contact_hand_position_m = hand_position.tolist()
+        measured_contact_hand_orientation_wxyz = hand_orientation.tolist()
+        plan_contact_hand_position_error_m = float(
+            np.linalg.norm(hand_position - values["hand_contact_world"])
+        )
+        desired_rotation = Rotation.from_quat(
+            np.roll(np.asarray(values["hand_contact_orientation"], dtype=np.float64), -1)
+        )
+        measured_rotation = Rotation.from_quat(np.roll(hand_orientation, -1))
+        plan_contact_hand_rotation_error_rad = float(
+            (measured_rotation.inv() * desired_rotation).magnitude()
         )
 
     contact_audit_rows = [
@@ -807,6 +875,8 @@ def main() -> None:
         "pipeline": "automoma_native",
         "g2_inputs_used": False,
         "joint_plan_npz": None if ARGS.joint_plan_npz is None else str(ARGS.joint_plan_npz),
+        "transit_path_used": bool(transit_path_used),
+        "transit_waypoint_count": 0 if transit_path is None else int(len(transit_path)),
         "asset_usd": str(ARGS.asset_usd.resolve()),
         "asset_specific_parameters": False,
         "asset_translation_m": values["asset_translation"].tolist(),
@@ -841,6 +911,15 @@ def main() -> None:
         "contact_stage_audit_enabled": bool(ARGS.abort_after_contact_audit),
         "contact_stage_early_abort_reason": early_abort_reason,
         "plan_contact_joint_error_rad": plan_contact_joint_error_rad,
+        "planned_contact_arm_joints": (
+            None if arm_path is None else arm_path[0].tolist()
+        ),
+        "measured_contact_arm_joints": measured_contact_arm_joints,
+        "planned_contact_hand_position_m": values.get("hand_contact_world", contact_world).tolist(),
+        "measured_contact_hand_position_m": measured_contact_hand_position_m,
+        "measured_contact_hand_orientation_wxyz": measured_contact_hand_orientation_wxyz,
+        "plan_contact_hand_position_error_m": plan_contact_hand_position_error_m,
+        "plan_contact_hand_rotation_error_rad": plan_contact_hand_rotation_error_rad,
         "passive_baseline_drift_fraction": passive_baseline_drift,
         "max_passive_drift_fraction": float(ARGS.max_passive_drift_fraction),
         "passive_baseline_failed": passive_baseline_failed,

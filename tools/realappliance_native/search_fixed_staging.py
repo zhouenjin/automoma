@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from curobo.geom.types import WorldConfig
 from curobo.types.base import TensorDeviceType
 from curobo.types.state import JointState
 from curobo.util_file import load_yaml
@@ -28,6 +29,7 @@ from tools.realappliance_native.smoke_plan_akr import (
     pose_list,
     pose_matrix,
     solve_ik,
+    static_obstacle_meshes,
 )
 
 
@@ -45,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-robot-config", type=Path, required=True)
     parser.add_argument("--target-fraction", type=float, default=0.8)
     parser.add_argument("--ik-seeds", type=int, default=128)
+    parser.add_argument("--static-mesh-pitch-m", type=float, default=0.005)
     parser.add_argument("--x-values", type=float_values, default=(0.35, 0.45, 0.55, 0.65))
     parser.add_argument("--y-values", type=float_values, default=(-0.3, -0.15, 0.0, 0.15, 0.3))
     parser.add_argument("--z-values", type=float_values, default=(0.55, 0.7, 0.85))
@@ -91,8 +94,7 @@ def main() -> None:
 
     records = []
     search_index = 0
-    for candidate, x, y, z, yaw in product(
-        candidates,
+    for x, y, z, yaw in product(
         args.x_values,
         args.y_values,
         args.z_values,
@@ -112,64 +114,72 @@ def main() -> None:
         axis = component_to_world[:3, :3] @ axis_component
         axis /= np.linalg.norm(axis)
         pivot = (component_to_world @ pivot_component)[:3]
-        start_ee = component_to_world @ pose_matrix(candidate["component_to_gripper_base_pose"])
-        goal_ee = articulated_ee_pose(
-            start_ee,
-            joint_type=joint.joint_type,
-            axis=axis,
-            pivot=pivot,
-            delta_source=delta_source,
-            meters_per_unit=manifest.meters_per_unit,
-            fraction=1.0,
+        static_meshes = static_obstacle_meshes(
+            cloud, component_to_world, args.static_mesh_pitch_m
         )
-        start_iks = solve_ik(mg, pose_list(start_ee), retract, args.ik_seeds)
-        goal_iks = solve_ik(mg, pose_list(goal_ee), retract, args.ik_seeds)
-        start_count_raw = 0 if start_iks is None else len(start_iks)
-        goal_count_raw = 0 if goal_iks is None else len(goal_iks)
-        start_count = (
-            0
-            if start_iks is None
-            else int(
-                np.count_nonzero(
-                    mg.check_constraints(
-                        JointState.from_position(start_iks)
-                    ).feasible.detach().cpu().numpy()
+        mg.update_world(WorldConfig(mesh=static_meshes))
+        for candidate in candidates:
+            start_ee = component_to_world @ pose_matrix(
+                candidate["component_to_gripper_base_pose"]
+            )
+            goal_ee = articulated_ee_pose(
+                start_ee,
+                joint_type=joint.joint_type,
+                axis=axis,
+                pivot=pivot,
+                delta_source=delta_source,
+                meters_per_unit=manifest.meters_per_unit,
+                fraction=1.0,
+            )
+            start_iks = solve_ik(mg, pose_list(start_ee), retract, args.ik_seeds)
+            goal_iks = solve_ik(mg, pose_list(goal_ee), retract, args.ik_seeds)
+            start_count_raw = 0 if start_iks is None else len(start_iks)
+            goal_count_raw = 0 if goal_iks is None else len(goal_iks)
+            start_count = (
+                0
+                if start_iks is None or len(start_iks) == 0
+                else int(
+                    np.count_nonzero(
+                        mg.check_constraints(
+                            JointState.from_position(start_iks)
+                        ).feasible.detach().cpu().numpy()
+                    )
                 )
             )
-        )
-        goal_count = (
-            0
-            if goal_iks is None
-            else int(
-                np.count_nonzero(
-                    mg.check_constraints(
-                        JointState.from_position(goal_iks)
-                    ).feasible.detach().cpu().numpy()
+            goal_count = (
+                0
+                if goal_iks is None or len(goal_iks) == 0
+                else int(
+                    np.count_nonzero(
+                        mg.check_constraints(
+                            JointState.from_position(goal_iks)
+                        ).feasible.detach().cpu().numpy()
+                    )
                 )
             )
-        )
-        if start_count and goal_count:
-            records.append(
-                {
-                    "search_index": search_index,
-                    "candidate_rank": int(candidate["rank"]),
-                    "candidate_source": candidate["source_component"],
-                    "graspgen_confidence": float(candidate["graspgen_confidence"]),
-                    "staging_center": center.tolist(),
-                    "staging_yaw_rad": float(yaw),
-                    "asset_root_translation_m": asset_root_transform[:3, 3].tolist(),
-                    "asset_root_quaternion_wxyz": [
-                        float(root_quaternion_xyzw[3]),
-                        *[float(value) for value in root_quaternion_xyzw[:3]],
-                    ],
-                    "start_ik_count_raw": start_count_raw,
-                    "goal_ik_count_raw": goal_count_raw,
-                    "start_ik_count": start_count,
-                    "goal_ik_count": goal_count,
-                    "endpoint_score": int(min(start_count, goal_count)),
-                }
-            )
-        search_index += 1
+            if start_count and goal_count:
+                records.append(
+                    {
+                        "search_index": search_index,
+                        "candidate_rank": int(candidate["rank"]),
+                        "candidate_source": candidate["source_component"],
+                        "graspgen_confidence": float(candidate["graspgen_confidence"]),
+                        "staging_center": center.tolist(),
+                        "staging_yaw_rad": float(yaw),
+                        "asset_root_translation_m": asset_root_transform[:3, 3].tolist(),
+                        "asset_root_quaternion_wxyz": [
+                            float(root_quaternion_xyzw[3]),
+                            *[float(value) for value in root_quaternion_xyzw[:3]],
+                        ],
+                        "static_obstacle_count": len(static_meshes),
+                        "start_ik_count_raw": start_count_raw,
+                        "goal_ik_count_raw": goal_count_raw,
+                        "start_ik_count": start_count,
+                        "goal_ik_count": goal_count,
+                        "endpoint_score": int(min(start_count, goal_count)),
+                    }
+                )
+            search_index += 1
 
     records.sort(
         key=lambda value: (
@@ -195,6 +205,8 @@ def main() -> None:
         "endpoint_reachable_count": len(records),
         "reachable_candidate_count": len(candidate_queue),
         "candidate_queue": candidate_queue,
+        "static_obstacle_representation": "pointcloud_marching_cubes",
+        "static_mesh_pitch_m": args.static_mesh_pitch_m,
         "results": records,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
