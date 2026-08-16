@@ -190,13 +190,20 @@ def build_akr_robot_config(
     extras = dict(kinematics.get("extra_links", {}))
     extras.pop("attached_object", None)
     component_link = "realappliance_grasped_component"
+    child_joint_frame = "realappliance_child_joint_frame"
+    target_joint_link = "realappliance_target_joint_link"
     anchor_link = "realappliance_object_anchor"
     target_joint_name = "realappliance_target_joint"
 
     component_to_ee = _pose_matrix(component_to_ee_pose[:3], component_to_ee_pose[3:])
     ee_to_component = np.linalg.inv(component_to_ee)
-    child_to_parent_zero = np.linalg.inv(
-        parent_to_child_zero(joint, manifest.meters_per_unit)
+    component_to_joint = _pose_matrix(
+        np.asarray(joint.local_position_child) * manifest.meters_per_unit,
+        joint.local_rotation_child_wxyz,
+    )
+    parent_to_joint = _pose_matrix(
+        np.asarray(joint.local_position_parent) * manifest.meters_per_unit,
+        joint.local_rotation_parent_wxyz,
     )
     lower = joint.lower_limit if joint.lower_limit is not None else -1.0e3
     upper = joint.upper_limit if joint.upper_limit is not None else 1.0e3
@@ -211,13 +218,27 @@ def build_akr_robot_config(
         "joint_type": "FIXED",
         "joint_name": "realappliance_grasp_attachment",
     }
-    extras[anchor_link] = {
+    extras[child_joint_frame] = {
         "parent_link_name": component_link,
-        "link_name": anchor_link,
-        "fixed_transform": _matrix_pose(child_to_parent_zero),
+        "link_name": child_joint_frame,
+        "fixed_transform": _matrix_pose(component_to_joint),
+        "joint_type": "FIXED",
+        "joint_name": "realappliance_child_joint_frame_fixed",
+    }
+    extras[target_joint_link] = {
+        "parent_link_name": child_joint_frame,
+        "link_name": target_joint_link,
+        "fixed_transform": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         "joint_type": _joint_type(joint),
         "joint_name": target_joint_name,
         "joint_limits": akr_limits,
+    }
+    extras[anchor_link] = {
+        "parent_link_name": target_joint_link,
+        "link_name": anchor_link,
+        "fixed_transform": _matrix_pose(np.linalg.inv(parent_to_joint)),
+        "joint_type": "FIXED",
+        "joint_name": "realappliance_parent_joint_frame_fixed",
     }
     kinematics["extra_links"] = extras
     # The reversed chain terminates at the stationary appliance body.  Making

@@ -243,10 +243,14 @@ def test_akr_inverts_target_joint_and_keeps_g2_out_of_provenance() -> None:
     )
 
     kinematics = akr["robot_cfg"]["kinematics"]
-    target = kinematics["extra_links"]["realappliance_object_anchor"]
+    target = kinematics["extra_links"]["realappliance_target_joint_link"]
     assert target["joint_type"] == "Y_ROT"
     assert np.allclose(target["joint_limits"], [-np.pi / 2.0, 0.0])
     assert kinematics["ee_link"] == "realappliance_object_anchor"
+    assert (
+        kinematics["extra_links"]["realappliance_object_anchor"]["joint_type"]
+        == "FIXED"
+    )
     assert kinematics["cspace"]["joint_names"][-1] == "realappliance_target_joint"
     assert akr["realappliance_native"]["g2_inputs_used"] is False
     assert "attached_object" not in kinematics["extra_links"]
