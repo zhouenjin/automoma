@@ -368,8 +368,8 @@ def test_physical_search_expands_automatic_candidate_and_path_order(tmp_path):
                 "success": True,
                 "planning": {
                     "automatic_trajectory_selection": {
-                        "ranked_valid_trajectory_indices": [1],
-                        "scores_per_trajectory": [99.0, 3.0],
+                        "ranked_valid_trajectory_indices": [1, 0],
+                        "scores_per_trajectory": [4.0, 3.0],
                     }
                 },
             },
@@ -380,6 +380,7 @@ def test_physical_search_expands_automatic_candidate_and_path_order(tmp_path):
     assert [(trial.attempt_id, trial.trajectory_index) for trial in trials] == [
         ("rank0", 1),
         ("rank1", 2),
+        ("rank0", 0),
         ("rank1", 0),
     ]
 

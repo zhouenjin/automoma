@@ -54,13 +54,19 @@ def enumerate_physical_trials(
                 trajectory_score=float(scores[trajectory_index]),
             )
             trials.append((attempt_order, path_order, trial))
+    # Search breadth before exhausting trajectory variants of one hypothesis.
+    # Round zero executes the best valid AKR path for every learned-contact and
+    # hand hypothesis, round one executes each hypothesis' second-best path,
+    # and so on.  This preserves the learned candidate rank within each round
+    # while preventing a large path pool for one grasp from consuming the
+    # complete physical budget.
     trials.sort(
         key=lambda item: (
+            item[1],
             item[2].automatic_rank,
+            item[2].trajectory_score,
             -item[2].pre_ik_score,
             item[0],
-            item[1],
-            item[2].trajectory_score,
         )
     )
     return tuple(item[2] for item in trials)
