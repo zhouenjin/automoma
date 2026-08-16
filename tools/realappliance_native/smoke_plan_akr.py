@@ -301,9 +301,10 @@ def main() -> None:
     manifold_constraint_metrics = None
     manifold_valid = False
     if manifold_failure is None and len(manifold_layers) == args.manifold_waypoints:
+        base_dof = manifold_layers[0].shape[1] - 1
         manifold_retract = torch.cat(
             [
-                retract,
+                retract[:base_dof],
                 torch.as_tensor([akr_initial], device=retract.device, dtype=retract.dtype),
             ]
         )
