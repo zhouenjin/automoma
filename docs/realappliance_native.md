@@ -147,6 +147,11 @@ robot-relative translation/yaw grid. Its best pose produced a 32/32 feasible
 manifold path (44--202 collision-feasible IK solutions per layer) with maximum
 anchor drift `1.674e-5 m`. The physical executor consumes only the seven Franka
 columns from that path; the eighth AKR/object column is never sent to PhysX.
+The staging report emits one best pose per candidate rank as an automatic queue,
+including the asset-root transform required by the executor. Endpoint ranking
+now applies cuRobo's complete robot constraint check to raw IK solutions and
+stores raw and constraint-feasible counts separately, so a self-colliding IK
+cluster cannot outrank a smaller set of executable endpoints.
 
 Strict physical replay rejected all three initially tested candidates:
 

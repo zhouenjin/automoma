@@ -17,6 +17,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from curobo.types.base import TensorDeviceType
+from curobo.types.state import JointState
 from curobo.util_file import load_yaml
 
 from automoma.integrations.realappliance_native import manifest_from_mapping
@@ -123,8 +124,30 @@ def main() -> None:
         )
         start_iks = solve_ik(mg, pose_list(start_ee), retract, args.ik_seeds)
         goal_iks = solve_ik(mg, pose_list(goal_ee), retract, args.ik_seeds)
-        start_count = 0 if start_iks is None else len(start_iks)
-        goal_count = 0 if goal_iks is None else len(goal_iks)
+        start_count_raw = 0 if start_iks is None else len(start_iks)
+        goal_count_raw = 0 if goal_iks is None else len(goal_iks)
+        start_count = (
+            0
+            if start_iks is None
+            else int(
+                np.count_nonzero(
+                    mg.check_constraints(
+                        JointState.from_position(start_iks)
+                    ).feasible.detach().cpu().numpy()
+                )
+            )
+        )
+        goal_count = (
+            0
+            if goal_iks is None
+            else int(
+                np.count_nonzero(
+                    mg.check_constraints(
+                        JointState.from_position(goal_iks)
+                    ).feasible.detach().cpu().numpy()
+                )
+            )
+        )
         if start_count and goal_count:
             records.append(
                 {
@@ -139,6 +162,8 @@ def main() -> None:
                         float(root_quaternion_xyzw[3]),
                         *[float(value) for value in root_quaternion_xyzw[:3]],
                     ],
+                    "start_ik_count_raw": start_count_raw,
+                    "goal_ik_count_raw": goal_count_raw,
                     "start_ik_count": start_count,
                     "goal_ik_count": goal_count,
                     "endpoint_score": int(min(start_count, goal_count)),
