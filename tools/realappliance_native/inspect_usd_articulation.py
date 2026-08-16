@@ -46,6 +46,23 @@ def local_position(joint: UsdPhysics.Joint, body_index: int) -> tuple[float, flo
     return tuple(float(component) for component in value) if value is not None else (0.0, 0.0, 0.0)
 
 
+def local_rotation(joint: UsdPhysics.Joint, body_index: int) -> tuple[float, float, float, float]:
+    attribute = joint.GetLocalRot0Attr() if body_index == 0 else joint.GetLocalRot1Attr()
+    value = attribute.Get()
+    if value is None:
+        return (1.0, 0.0, 0.0, 0.0)
+    imaginary = value.GetImaginary()
+    return (float(value.GetReal()), *(float(component) for component in imaginary))
+
+
+def transformed_bounds(points, transform) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    transformed = [transform.Transform(point) for point in points]
+    return (
+        tuple(min(float(point[index]) for point in transformed) for index in range(3)),
+        tuple(max(float(point[index]) for point in transformed) for index in range(3)),
+    )
+
+
 def optional_float(attribute) -> float | None:
     value = attribute.Get()
     return float(value) if value is not None else None
@@ -71,6 +88,7 @@ def inspect() -> RealApplianceUsdManifest:
         [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
         useExtentsHint=True,
     )
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     for prim in prims:
         if prim.IsA(UsdGeom.Mesh):
             mesh_path = str(prim.GetPath())
@@ -83,6 +101,13 @@ def inspect() -> RealApplianceUsdManifest:
             lower = aligned_range.GetMin()
             upper = aligned_range.GetMax()
             points = UsdGeom.Mesh(prim).GetPointsAttr().Get() or ()
+            owner_bounds_min = None
+            owner_bounds_max = None
+            if owner and points:
+                mesh_to_world = xform_cache.GetLocalToWorldTransform(prim)
+                world_to_owner = xform_cache.GetLocalToWorldTransform(owner).GetInverse()
+                mesh_to_owner = mesh_to_world * world_to_owner
+                owner_bounds_min, owner_bounds_max = transformed_bounds(points, mesh_to_owner)
             mesh_geometries.append(
                 UsdMeshGeometry(
                     path=mesh_path,
@@ -90,6 +115,8 @@ def inspect() -> RealApplianceUsdManifest:
                     world_bounds_min=tuple(float(value) for value in lower),
                     world_bounds_max=tuple(float(value) for value in upper),
                     point_count=len(points),
+                    rigid_body_bounds_min=owner_bounds_min,
+                    rigid_body_bounds_max=owner_bounds_max,
                 )
             )
         if prim.HasAPI(UsdPhysics.RigidBodyAPI):
@@ -128,6 +155,8 @@ def inspect() -> RealApplianceUsdManifest:
                 upper_limit=upper_limit,
                 local_position_parent=local_position(joint, 0),
                 local_position_child=local_position(joint, 1),
+                local_rotation_parent_wxyz=local_rotation(joint, 0),
+                local_rotation_child_wxyz=local_rotation(joint, 1),
             )
         )
 
@@ -138,6 +167,7 @@ def inspect() -> RealApplianceUsdManifest:
         mesh_paths=tuple(meshes),
         rigid_body_paths=tuple(rigid_bodies),
         mesh_geometries=tuple(mesh_geometries),
+        meters_per_unit=float(UsdGeom.GetStageMetersPerUnit(stage)),
     )
     if not choose_open_joint_candidates(manifest.joints):
         raise RuntimeError("USD contains no mechanically meaningful open candidates")

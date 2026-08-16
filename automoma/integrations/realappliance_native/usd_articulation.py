@@ -27,6 +27,8 @@ class UsdJointDescriptor:
     upper_limit: float | None
     local_position_parent: tuple[float, float, float]
     local_position_child: tuple[float, float, float]
+    local_rotation_parent_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    local_rotation_child_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
     @property
     def movable(self) -> bool:
@@ -51,6 +53,8 @@ class UsdMeshGeometry:
     world_bounds_min: tuple[float, float, float]
     world_bounds_max: tuple[float, float, float]
     point_count: int
+    rigid_body_bounds_min: tuple[float, float, float] | None = None
+    rigid_body_bounds_max: tuple[float, float, float] | None = None
 
     @property
     def extent(self) -> tuple[float, float, float]:
@@ -68,6 +72,15 @@ class UsdMeshGeometry:
         value = asdict(self)
         value["extent"] = self.extent
         return value
+
+    @property
+    def rigid_body_extent(self) -> tuple[float, float, float] | None:
+        if self.rigid_body_bounds_min is None or self.rigid_body_bounds_max is None:
+            return None
+        return tuple(
+            max(0.0, upper - lower)
+            for lower, upper in zip(self.rigid_body_bounds_min, self.rigid_body_bounds_max)
+        )
 
 
 @dataclass(frozen=True)
@@ -127,6 +140,7 @@ class RealApplianceUsdManifest:
     mesh_paths: tuple[str, ...]
     rigid_body_paths: tuple[str, ...]
     mesh_geometries: tuple[UsdMeshGeometry, ...] = ()
+    meters_per_unit: float = 1.0
 
     @property
     def openable_joints(self) -> tuple[UsdJointDescriptor, ...]:
@@ -142,6 +156,7 @@ class RealApplianceUsdManifest:
             },
             "asset_id": self.asset_id,
             "source_usd": self.source_usd,
+            "meters_per_unit": self.meters_per_unit,
             "joints": [joint.to_dict() for joint in self.joints],
             "openable_joint_paths": [joint.path for joint in self.openable_joints],
             "mesh_paths": list(self.mesh_paths),
@@ -245,6 +260,12 @@ def descriptor_from_mapping(value: Mapping[str, object]) -> UsdJointDescriptor:
             raise ValueError(f"{name} must contain three values")
         return tuple(float(component) for component in raw)
 
+    def quaternion(name: str) -> tuple[float, float, float, float]:
+        raw = value.get(name, (1.0, 0.0, 0.0, 0.0))
+        if not isinstance(raw, Sequence) or len(raw) != 4:
+            raise ValueError(f"{name} must contain four values")
+        return tuple(float(component) for component in raw)
+
     return UsdJointDescriptor(
         path=str(value["path"]),
         joint_type=str(value["joint_type"]),
@@ -259,4 +280,39 @@ def descriptor_from_mapping(value: Mapping[str, object]) -> UsdJointDescriptor:
         ),
         local_position_parent=vector("local_position_parent"),
         local_position_child=vector("local_position_child"),
+        local_rotation_parent_wxyz=quaternion("local_rotation_parent_wxyz"),
+        local_rotation_child_wxyz=quaternion("local_rotation_child_wxyz"),
+    )
+
+
+def manifest_from_mapping(value: Mapping[str, object]) -> RealApplianceUsdManifest:
+    """Restore a manifest written by the Isaac-side inventory tool."""
+
+    geometries = []
+    for raw in value.get("mesh_geometries", ()):  # type: ignore[union-attr]
+        geometry = dict(raw)
+
+        def optional_vector(name: str):
+            data = geometry.get(name)
+            return tuple(float(item) for item in data) if data is not None else None
+
+        geometries.append(
+            UsdMeshGeometry(
+                path=str(geometry["path"]),
+                rigid_body=(str(geometry["rigid_body"]) if geometry.get("rigid_body") else None),
+                world_bounds_min=tuple(float(item) for item in geometry["world_bounds_min"]),
+                world_bounds_max=tuple(float(item) for item in geometry["world_bounds_max"]),
+                point_count=int(geometry["point_count"]),
+                rigid_body_bounds_min=optional_vector("rigid_body_bounds_min"),
+                rigid_body_bounds_max=optional_vector("rigid_body_bounds_max"),
+            )
+        )
+    return RealApplianceUsdManifest(
+        asset_id=str(value["asset_id"]),
+        source_usd=str(value["source_usd"]),
+        joints=tuple(descriptor_from_mapping(raw) for raw in value.get("joints", ())),  # type: ignore[arg-type]
+        mesh_paths=tuple(str(item) for item in value.get("mesh_paths", ())),
+        rigid_body_paths=tuple(str(item) for item in value.get("rigid_body_paths", ())),
+        mesh_geometries=tuple(geometries),
+        meters_per_unit=float(value.get("meters_per_unit", 1.0)),
     )

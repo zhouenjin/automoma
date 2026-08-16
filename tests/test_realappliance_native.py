@@ -8,6 +8,7 @@ from automoma.integrations.realappliance_native import (
     RealApplianceUsdManifest,
     UsdJointDescriptor,
     UsdMeshGeometry,
+    build_akr_robot_config,
     build_open_joint_components,
     choose_open_joint_candidates,
 )
@@ -178,3 +179,73 @@ def test_open_component_includes_fixed_handle_and_ranks_large_door_first() -> No
     assert components[0].joint.path == door.path
     assert components[0].rigid_bodies == ("/World/door", "/World/handle")
     assert "/World/handle/mesh" in components[0].mesh_paths
+
+
+def test_akr_inverts_target_joint_and_keeps_g2_out_of_provenance() -> None:
+    joint = UsdJointDescriptor(
+        path="/World/door/hinge",
+        joint_type="revolute",
+        parent_body="/World/body",
+        child_body="/World/door",
+        axis="Y",
+        lower_limit=0.0,
+        upper_limit=90.0,
+        local_position_parent=(0.0, 0.0, 0.0),
+        local_position_child=(0.0, 0.0, 0.0),
+    )
+    geometry = UsdMeshGeometry(
+        "/World/door/mesh",
+        "/World/door",
+        (0.0, 0.0, 0.0),
+        (0.4, 0.05, 0.3),
+        100,
+        (0.0, 0.0, 0.0),
+        (0.4, 0.05, 0.3),
+    )
+    manifest = RealApplianceUsdManifest(
+        asset_id="unseen",
+        source_usd="/tmp/Aligned.usd",
+        joints=(joint,),
+        mesh_paths=(geometry.path,),
+        rigid_body_paths=("/World/body", "/World/door"),
+        mesh_geometries=(geometry,),
+    )
+    component = build_open_joint_components(manifest)[0]
+    base = {
+        "robot_cfg": {
+            "kinematics": {
+                "ee_link": "panda_hand",
+                "extra_links": {
+                    "attached_object": {
+                        "parent_link_name": "panda_hand",
+                        "link_name": "attached_object",
+                    }
+                },
+                "collision_link_names": ["panda_hand", "attached_object"],
+                "collision_spheres": {},
+                "self_collision_buffer": {"panda_hand": 0.0},
+                "self_collision_ignore": {"panda_hand": []},
+                "cspace": {
+                    "joint_names": ["panda_joint1"],
+                    "retract_config": [0.0],
+                    "null_space_weight": [1.0],
+                    "cspace_distance_weight": [1.0],
+                },
+            }
+        }
+    }
+
+    akr = build_akr_robot_config(
+        base,
+        manifest,
+        component,
+        component_to_ee_pose=(0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+    )
+
+    kinematics = akr["robot_cfg"]["kinematics"]
+    target = kinematics["extra_links"]["realappliance_object_anchor"]
+    assert target["joint_type"] == "Y_ROT"
+    assert np.allclose(target["joint_limits"], [-np.pi / 2.0, 0.0])
+    assert kinematics["cspace"]["joint_names"][-1] == "realappliance_target_joint"
+    assert akr["realappliance_native"]["g2_inputs_used"] is False
+    assert "attached_object" not in kinematics["extra_links"]
