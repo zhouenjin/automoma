@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifold-waypoints", type=int, default=32)
     parser.add_argument("--manifold-ik-seeds", type=int, default=256)
     parser.add_argument("--staging-center", type=float, nargs=3, default=(0.75, 0.0, 0.8))
+    parser.add_argument("--staging-yaw-rad", type=float, default=0.0)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -191,16 +192,28 @@ def main() -> None:
     cloud = np.load(args.component_cloud)
 
     component_to_ee = pose_matrix(candidate["component_to_gripper_base_pose"])
-    component_to_world = np.asarray(cloud["component_to_world"], dtype=np.float64)
+    source_component_to_world = np.asarray(
+        cloud["component_to_world"], dtype=np.float64
+    )
     component_center = np.asarray(cloud["points_component_m"], dtype=np.float64).mean(axis=0)
-    source_translation = component_to_world[:3, 3].copy()
+    source_axis_world = np.asarray(cloud["joint_axis_world"], dtype=np.float64)
+    source_pivot_world = np.asarray(cloud["joint_pivot_world_m"], dtype=np.float64)
+    axis_component = source_component_to_world[:3, :3].T @ source_axis_world
+    pivot_component = np.linalg.inv(source_component_to_world) @ np.asarray(
+        [*source_pivot_world.tolist(), 1.0]
+    )
+    component_to_world = source_component_to_world.copy()
+    component_to_world[:3, :3] = (
+        Rotation.from_rotvec(np.asarray([0.0, 0.0, args.staging_yaw_rad])).as_matrix()
+        @ source_component_to_world[:3, :3]
+    )
     component_to_world[:3, 3] = np.asarray(args.staging_center) - (
         component_to_world[:3, :3] @ component_center
     )
-    staging_shift = component_to_world[:3, 3] - source_translation
     start_ee = component_to_world @ component_to_ee
-    axis = np.asarray(cloud["joint_axis_world"], dtype=np.float64)
-    pivot = np.asarray(cloud["joint_pivot_world_m"], dtype=np.float64) + staging_shift
+    axis = component_to_world[:3, :3] @ axis_component
+    axis = axis / np.linalg.norm(axis)
+    pivot = (component_to_world @ pivot_component)[:3]
 
     lower = float(joint.lower_limit if joint.lower_limit is not None else 0.0)
     upper = float(joint.upper_limit if joint.upper_limit is not None else 0.0)
@@ -406,6 +419,8 @@ def main() -> None:
         "source_initial_position": initial,
         "source_goal_position": source_goal,
         "target_fraction": args.target_fraction,
+        "staging_center": list(args.staging_center),
+        "staging_yaw_rad": args.staging_yaw_rad,
         "start_ik_count": len(start_iks),
         "goal_ik_count": len(goal_iks),
         "trajectory_count": len(trajectories),
