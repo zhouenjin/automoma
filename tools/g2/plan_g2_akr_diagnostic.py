@@ -39,6 +39,10 @@ from automoma.integrations.realappliance.transform_math import (  # noqa: E402
     rotation_matrix_to_quaternion_wxyz,
 )
 from automoma.integrations.realappliance.usd_task import ExtractedUsdTask, extract_usd_tasks  # noqa: E402
+from automoma.integrations.realappliance.usd_collision import (  # noqa: E402
+    fixed_body_cluster,
+    load_placed_collision_world,
+)
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -67,7 +71,7 @@ def _goal_ee_pose(task: ExtractedUsdTask, world_from_ee_start: Sequence[Sequence
 
 
 class HandPlanner:
-    """Cache one collision-free IK solver per hand for the diagnostic gate."""
+    """Cache one kinematic IK solver per hand for the diagnostic gate."""
 
     def __init__(self, hand: Hand, config: Dict[str, Any], ik_seeds: int):
         from curobo.types.base import TensorDeviceType
@@ -134,6 +138,30 @@ def _terminal_fk_audit(motion_gen: Any, trajectories: torch.Tensor) -> Dict[str,
     }
 
 
+def _base_motion_audit(trajectories: torch.Tensor, valid: torch.Tensor) -> Dict[str, Any]:
+    """Measure optimized planar-base motion without imposing a fixed sharing ratio."""
+
+    base = trajectories[:, :, :3]
+    delta_xy = base[:, 1:, :2] - base[:, :-1, :2]
+    delta_yaw = base[:, 1:, 2] - base[:, :-1, 2]
+    net_xy = torch.linalg.vector_norm(base[:, -1, :2] - base[:, 0, :2], dim=-1)
+    path_xy = torch.sum(torch.linalg.vector_norm(delta_xy, dim=-1), dim=-1)
+    net_yaw = torch.abs(base[:, -1, 2] - base[:, 0, 2])
+    path_yaw = torch.sum(torch.abs(delta_yaw), dim=-1)
+    valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
+    return {
+        "net_xy_m_per_trajectory": net_xy.tolist(),
+        "path_xy_m_per_trajectory": path_xy.tolist(),
+        "net_yaw_rad_per_trajectory": net_yaw.tolist(),
+        "path_yaw_rad_per_trajectory": path_yaw.tolist(),
+        "valid_trajectory_indices": valid_indices.tolist(),
+        "valid_net_xy_m": net_xy[valid_indices].tolist(),
+        "valid_path_xy_m": path_xy[valid_indices].tolist(),
+        "valid_net_yaw_rad": net_yaw[valid_indices].tolist(),
+        "valid_path_yaw_rad": path_yaw[valid_indices].tolist(),
+    }
+
+
 def _plan_augmented_trajectory(
     start_robot: torch.Tensor,
     goal_robot: torch.Tensor,
@@ -143,7 +171,9 @@ def _plan_augmented_trajectory(
     maximum_pairs: int,
     planning_fraction: float,
     acceptance_fraction: float,
+    world_model: Any,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+    from curobo.geom.sdf.world import CollisionCheckerType
     from curobo.rollout.rollout_base import Goal
     from curobo.rollout.cost.pose_cost import PoseCostMetric
     from curobo.types.base import TensorDeviceType
@@ -158,7 +188,7 @@ def _plan_augmented_trajectory(
     tensor_args = TensorDeviceType()
     motion_config = MotionGenConfig.load_from_robot_config(
         copy.deepcopy(akr_config["robot_cfg"]),
-        None,
+        world_model,
         tensor_args,
         num_trajopt_seeds=8,
         num_graph_seeds=4,
@@ -166,7 +196,7 @@ def _plan_augmented_trajectory(
         interpolation_dt=0.05,
         optimize_dt=True,
         use_cuda_graph=False,
-        collision_checker_type=None,
+        collision_checker_type=CollisionCheckerType.MESH,
     )
     motion_gen = MotionGen(motion_config)
     start_state = JointState.from_position(tensor_args.to_device(start))
@@ -201,6 +231,7 @@ def _plan_augmented_trajectory(
     rotation_ok = torch.as_tensor(audit["rotation_drift_per_trajectory_rad"]) <= 0.05
     progress_ok = achieved_open_fraction >= acceptance_fraction
     valid = trajopt_success & position_ok & rotation_ok & progress_ok
+    base_motion_audit = _base_motion_audit(trajectories, valid)
     result_report = {
         "pair_count": int(start.shape[0]),
         "trajopt_successful_plans": int(trajopt_success.sum().item()),
@@ -210,6 +241,7 @@ def _plan_augmented_trajectory(
         "acceptance_fraction": acceptance_fraction,
         "status": str(getattr(result, "status", "not_exposed_by_trajopt_result")),
         "terminal_fk_audit": audit,
+        "base_motion_audit": base_motion_audit,
     }
     tensors = {
         "start_states": start.detach().cpu(),
@@ -260,7 +292,7 @@ def main() -> int:
     hand_planners = {hand: HandPlanner(hand, base_configs[hand], args.ik_seeds) for hand in hands}
     report: Dict[str, Any] = {
         "schema_version": 1,
-        "mode": "kinematic_akr_diagnostic_no_world_collision",
+        "mode": "akr_diagnostic_fixed_appliance_mesh_collision",
         "dataset_ready": False,
         "source_usd": str(source_usd.resolve()),
         "candidate_file": str(args.candidate_file.resolve()),
@@ -269,6 +301,7 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     for task in tasks:
+        moving_cluster = fixed_body_cluster(source_usd, task.body1_path)
         candidates = load_contact_candidates(
             args.candidate_file,
             source_usd=source_usd,
@@ -293,6 +326,19 @@ def main() -> int:
                     capture_depth_fraction=depth_fraction,
                 )
                 placed_task = task.placed(placed.world_from_source)
+                collision_world = load_placed_collision_world(
+                    source_usd,
+                    placed.world_from_source,
+                    exclude_paths=moving_cluster,
+                    moving_cluster_paths=moving_cluster,
+                )
+                attempt["collision_world"] = {
+                    "planning_proxy_only": True,
+                    "included_mesh_paths": collision_world.included_mesh_paths,
+                    "excluded_mesh_paths": collision_world.excluded_mesh_paths,
+                    "moving_cluster_paths": collision_world.moving_cluster_paths,
+                    "physx_collision_policy": "all original collisions remain enabled during physical execution",
+                }
                 world_from_ee_start = np.asarray(placed.world_from_ee_contact)
                 world_from_ee_goal = _goal_ee_pose(placed_task, world_from_ee_start)
                 start_ik = hand_planners[hand].solve(world_from_ee_start, args.max_ik_solutions)
@@ -325,6 +371,7 @@ def main() -> int:
                     args.max_pairs,
                     placed_task.task.planning_fraction,
                     placed_task.task.acceptance_fraction,
+                    collision_world.world,
                 )
                 torch.save(tensors, attempt_dir / "trajectory.pt")
                 attempt["planning"] = planning_report

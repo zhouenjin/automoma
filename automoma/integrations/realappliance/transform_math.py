@@ -180,6 +180,21 @@ def quaternion_transform(position: Sequence[float], quaternion_wxyz: Sequence[fl
     return result
 
 
+def pose_wxyz_to_matrix(pose: Sequence[float]) -> np.ndarray:
+    """Convert ``[x, y, z, qw, qx, qy, qz]`` to a homogeneous matrix."""
+
+    if len(pose) != 7:
+        raise ValueError(f"expected a 7-D pose, got {pose!r}")
+    return quaternion_transform(pose[:3], pose[3:])
+
+
+def matrix_to_pose_wxyz(matrix: Sequence[Sequence[float]]) -> list[float]:
+    """Convert a homogeneous matrix to ``[x, y, z, qw, qx, qy, qz]``."""
+
+    transform = as_matrix4(matrix)
+    return [*transform[:3, 3].tolist(), *rotation_matrix_to_quaternion_wxyz(transform)]
+
+
 def transform_rpy_to_matrix(transform: TransformRPY) -> np.ndarray:
     """Convert a URDF fixed-axis RPY transform into a homogeneous matrix."""
 

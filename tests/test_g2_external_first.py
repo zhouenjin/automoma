@@ -23,7 +23,9 @@ from automoma.integrations.realappliance.g2_adapter import (
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
 from automoma.integrations.realappliance.transform_math import (
     axis_motion_transform,
+    matrix_to_pose_wxyz,
     matrix_to_transform_rpy,
+    pose_wxyz_to_matrix,
     quaternion_transform,
     rotation_matrix_to_quaternion_wxyz,
     transform_rpy_to_matrix,
@@ -185,6 +187,12 @@ def test_rpy_round_trip_preserves_rigid_transform():
     source = quaternion_transform((0.2, -0.4, 0.7), (0.91, 0.1, -0.25, 0.3))
     encoded = matrix_to_transform_rpy(source)
     assert np.allclose(transform_rpy_to_matrix(encoded), source, atol=1e-8)
+
+
+def test_curobo_pose_round_trip_preserves_rigid_transform():
+    source = quaternion_transform((0.2, -0.4, 0.7), (0.91, 0.1, -0.25, 0.3))
+    encoded = matrix_to_pose_wxyz(source)
+    assert np.allclose(pose_wxyz_to_matrix(encoded), source, atol=1e-8)
 
 
 def test_contact_candidate_placement_aligns_geometry_without_asset_rules():

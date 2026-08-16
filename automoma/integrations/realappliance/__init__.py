@@ -14,6 +14,7 @@ from .g2_adapter import (
 )
 from .hypotheses import BasePoseSeed, InteractionHypothesis, generate_interaction_hypotheses
 from .usd_task import ExtractedUsdTask, extract_usd_tasks, resolve_annotated_parts
+from .usd_collision import PlacedCollisionWorld, fixed_body_cluster, load_placed_collision_world
 
 __all__ = [
     "AkrAttachmentSpec",
@@ -27,15 +28,18 @@ __all__ = [
     "JointKind",
     "PhysicsRunPolicy",
     "PlacedContactCandidate",
+    "PlacedCollisionWorld",
     "PlanarBaseLimits",
     "TransformRPY",
     "build_g2_akr_urdf",
     "build_planar_g2_urdf",
     "fit_bounds_with_spheres",
+    "fixed_body_cluster",
     "extract_usd_tasks",
     "infer_link_visual_bounds",
     "generate_interaction_hypotheses",
     "load_contact_candidates",
+    "load_placed_collision_world",
     "make_g2_akr_config",
     "make_g2_curobo_config",
     "resolve_annotated_parts",
