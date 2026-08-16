@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-fraction", type=float, default=0.8)
     parser.add_argument("--pair-count", type=int, default=64)
     parser.add_argument("--ik-seeds", type=int, default=2048)
+    parser.add_argument("--manifold-waypoints", type=int, default=32)
+    parser.add_argument("--manifold-ik-seeds", type=int, default=256)
     parser.add_argument("--staging-center", type=float, nargs=3, default=(0.75, 0.0, 0.8))
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -131,6 +133,50 @@ def metric_summary(metrics) -> dict:
     return result
 
 
+def articulated_ee_pose(
+    start_ee: np.ndarray,
+    *,
+    joint_type: str,
+    axis: np.ndarray,
+    pivot: np.ndarray,
+    delta_source: float,
+    meters_per_unit: float,
+    fraction: float,
+) -> np.ndarray:
+    pose = start_ee.copy()
+    if joint_type == "revolute":
+        rotation = Rotation.from_rotvec(
+            axis * delta_source * fraction * pi / 180.0
+        ).as_matrix()
+        pose[:3, 3] = pivot + rotation @ (start_ee[:3, 3] - pivot)
+        pose[:3, :3] = rotation @ start_ee[:3, :3]
+    else:
+        pose[:3, 3] = (
+            start_ee[:3, 3]
+            + axis * delta_source * meters_per_unit * fraction
+        )
+    return pose
+
+
+def select_continuous_path(layers: list[torch.Tensor], retract: torch.Tensor) -> torch.Tensor:
+    """Select the shortest collision-feasible IK chain through all joint samples."""
+
+    costs = torch.linalg.vector_norm(layers[0] - retract.unsqueeze(0), dim=1)
+    parents = []
+    for previous, current in zip(layers[:-1], layers[1:]):
+        transition = torch.cdist(current, previous)
+        total = transition + costs.unsqueeze(0)
+        costs, parent = torch.min(total, dim=1)
+        parents.append(parent)
+    index = int(torch.argmin(costs).item())
+    indices = [index]
+    for parent in reversed(parents):
+        index = int(parent[index].item())
+        indices.append(index)
+    indices.reverse()
+    return torch.stack([layer[index] for layer, index in zip(layers, indices)])
+
+
 def main() -> None:
     args = parse_args()
     if not 0.0 < args.target_fraction <= 1.0:
@@ -165,16 +211,19 @@ def main() -> None:
     if negative_room > positive_room:
         source_goal = initial - args.target_fraction * negative_room
     delta_source = source_goal - initial
-    goal_ee = start_ee.copy()
+    goal_ee = articulated_ee_pose(
+        start_ee,
+        joint_type=joint.joint_type,
+        axis=axis,
+        pivot=pivot,
+        delta_source=delta_source,
+        meters_per_unit=manifest.meters_per_unit,
+        fraction=1.0,
+    )
     if joint.joint_type == "revolute":
-        rotation = Rotation.from_rotvec(axis * delta_source * pi / 180.0).as_matrix()
-        goal_ee[:3, 3] = pivot + rotation @ (start_ee[:3, 3] - pivot)
-        goal_ee[:3, :3] = rotation @ start_ee[:3, :3]
         akr_goal = -source_goal * pi / 180.0
         akr_initial = -initial * pi / 180.0
     else:
-        delta_m = delta_source * manifest.meters_per_unit
-        goal_ee[:3, 3] = start_ee[:3, 3] + axis * delta_m
         akr_goal = -source_goal * manifest.meters_per_unit
         akr_initial = -initial * manifest.meters_per_unit
 
@@ -199,6 +248,84 @@ def main() -> None:
     akr_raw = load_yaml(str(args.akr_config))
     akr_cfg = akr_raw["robot_cfg"]
     akr_mg = motion_gen(akr_cfg, tensor_args, seeds=min(args.ik_seeds, 512))
+
+    manifold_layers = []
+    manifold_layer_counts = []
+    manifold_failure = None
+    fractions = np.linspace(0.0, 1.0, args.manifold_waypoints)
+    for waypoint_index, fraction in enumerate(fractions):
+        waypoint_pose = articulated_ee_pose(
+            start_ee,
+            joint_type=joint.joint_type,
+            axis=axis,
+            pivot=pivot,
+            delta_source=delta_source,
+            meters_per_unit=manifest.meters_per_unit,
+            fraction=float(fraction),
+        )
+        waypoint_iks = solve_ik(
+            base_mg,
+            pose_list(waypoint_pose),
+            retract,
+            args.manifold_ik_seeds,
+        )
+        if waypoint_iks is None or len(waypoint_iks) == 0:
+            manifold_failure = f"waypoint_{waypoint_index}_ik_empty"
+            break
+        object_position = akr_initial + float(fraction) * (akr_goal - akr_initial)
+        waypoint_states = torch.cat(
+            [
+                waypoint_iks,
+                torch.full(
+                    (len(waypoint_iks), 1),
+                    object_position,
+                    device=waypoint_iks.device,
+                ),
+            ],
+            dim=1,
+        )
+        waypoint_metrics = akr_mg.check_constraints(
+            JointState.from_position(waypoint_states)
+        )
+        feasible = waypoint_metrics.feasible.reshape(-1).bool()
+        waypoint_states = waypoint_states[feasible]
+        manifold_layer_counts.append(int(len(waypoint_states)))
+        if len(waypoint_states) == 0:
+            manifold_failure = f"waypoint_{waypoint_index}_constraint_empty"
+            break
+        manifold_layers.append(waypoint_states)
+
+    manifold_path = None
+    manifold_anchor_position_error = None
+    manifold_anchor_rotation_error = None
+    manifold_constraint_metrics = None
+    manifold_valid = False
+    if manifold_failure is None and len(manifold_layers) == args.manifold_waypoints:
+        manifold_retract = torch.cat(
+            [
+                retract,
+                torch.as_tensor([akr_initial], device=retract.device, dtype=retract.dtype),
+            ]
+        )
+        manifold_path = select_continuous_path(manifold_layers, manifold_retract)
+        manifold_constraint_metrics = akr_mg.check_constraints(
+            JointState.from_position(manifold_path)
+        )
+        manifold_fk = akr_mg.ik_solver.fk(manifold_path).ee_pose
+        manifold_positions = manifold_fk.position.detach().cpu().numpy()
+        manifold_quaternions = manifold_fk.quaternion.detach().cpu().numpy()
+        manifold_anchor_position_error = float(
+            np.linalg.norm(manifold_positions - manifold_positions[-1], axis=1).max()
+        )
+        manifold_dots = np.abs(
+            (manifold_quaternions * manifold_quaternions[-1]).sum(axis=1)
+        ).clip(0.0, 1.0)
+        manifold_anchor_rotation_error = float((2.0 * np.arccos(manifold_dots)).max())
+        manifold_valid = bool(manifold_constraint_metrics.feasible.all()) and (
+            manifold_anchor_position_error <= 0.01
+            and manifold_anchor_rotation_error <= 0.05
+        )
+
     start_state = JointState.from_position(start)
     goal_state = JointState.from_position(goal)
     start_endpoint_feasible, start_endpoint_status = endpoint_diagnostics(akr_mg, start)
@@ -244,6 +371,21 @@ def main() -> None:
         trajectory_metric_constraint=tensor_to_numpy(
             result.metrics.constraint if result.metrics is not None else None
         ),
+        manifold_path=(
+            np.empty((0, start.shape[1]))
+            if manifold_path is None
+            else tensor_to_numpy(manifold_path)
+        ),
+        manifold_constraint_feasible=(
+            None
+            if manifold_constraint_metrics is None
+            else tensor_to_numpy(manifold_constraint_metrics.feasible)
+        ),
+        manifold_constraint=(
+            None
+            if manifold_constraint_metrics is None
+            else tensor_to_numpy(manifold_constraint_metrics.constraint)
+        ),
         trajectories=trajectories.numpy(),
         trajopt_success=success.numpy(),
         anchor_valid=np.asarray(valid),
@@ -278,6 +420,13 @@ def main() -> None:
         "start_constraint_metrics": metric_summary(start_constraint_metrics),
         "goal_constraint_metrics": metric_summary(goal_constraint_metrics),
         "trajectory_metrics": metric_summary(result.metrics),
+        "manifold_waypoints_requested": args.manifold_waypoints,
+        "manifold_layer_feasible_counts": manifold_layer_counts,
+        "manifold_failure": manifold_failure,
+        "manifold_valid": manifold_valid,
+        "manifold_anchor_position_error_m": manifold_anchor_position_error,
+        "manifold_anchor_rotation_error_rad": manifold_anchor_rotation_error,
+        "manifold_constraint_metrics": metric_summary(manifold_constraint_metrics),
         "anchor_valid_count": int(np.asarray(valid).sum()),
         "strict_physical_success": False,
         "strict_physical_pending": True,
