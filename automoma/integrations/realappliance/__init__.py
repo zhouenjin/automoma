@@ -15,6 +15,7 @@ from .g2_adapter import (
 from .hypotheses import BasePoseSeed, InteractionHypothesis, generate_interaction_hypotheses
 from .usd_task import ExtractedUsdTask, extract_usd_tasks, resolve_annotated_parts
 from .usd_collision import PlacedCollisionWorld, fixed_body_cluster, load_placed_collision_world
+from .trajectory_selection import weighted_cspace_path_scores
 
 __all__ = [
     "AkrAttachmentSpec",
@@ -43,4 +44,5 @@ __all__ = [
     "make_g2_akr_config",
     "make_g2_curobo_config",
     "resolve_annotated_parts",
+    "weighted_cspace_path_scores",
 ]

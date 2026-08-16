@@ -43,6 +43,7 @@ from automoma.integrations.realappliance.usd_collision import (  # noqa: E402
     fixed_body_cluster,
     load_placed_collision_world,
 )
+from automoma.integrations.realappliance.trajectory_selection import weighted_cspace_path_scores  # noqa: E402
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -232,6 +233,11 @@ def _plan_augmented_trajectory(
     progress_ok = achieved_open_fraction >= acceptance_fraction
     valid = trajopt_success & position_ok & rotation_ok & progress_ok
     base_motion_audit = _base_motion_audit(trajectories, valid)
+    selection = weighted_cspace_path_scores(
+        trajectories.numpy(),
+        valid.numpy(),
+        akr_config["robot_cfg"]["kinematics"]["cspace"]["cspace_distance_weight"],
+    )
     result_report = {
         "pair_count": int(start.shape[0]),
         "trajopt_successful_plans": int(trajopt_success.sum().item()),
@@ -242,6 +248,7 @@ def _plan_augmented_trajectory(
         "status": str(getattr(result, "status", "not_exposed_by_trajopt_result")),
         "terminal_fk_audit": audit,
         "base_motion_audit": base_motion_audit,
+        "automatic_trajectory_selection": selection,
     }
     tensors = {
         "start_states": start.detach().cpu(),
@@ -249,6 +256,7 @@ def _plan_augmented_trajectory(
         "trajectories": trajectories,
         "trajopt_success": trajopt_success,
         "success": valid,
+        "selected_trajectory_index": selection["selected_trajectory_index"],
     }
     return result_report, tensors
 

@@ -31,6 +31,7 @@ from automoma.integrations.realappliance.transform_math import (
     transform_rpy_to_matrix,
 )
 from automoma.integrations.realappliance.usd_task import ExtractedUsdTask, resolve_annotated_parts
+from automoma.integrations.realappliance.trajectory_selection import weighted_cspace_path_scores
 
 
 MINIMAL_G2 = """<?xml version="1.0"?>
@@ -285,6 +286,20 @@ def test_physics_policy_rejects_object_joint_writes():
     with pytest.raises(ValueError, match="write_target_joint"):
         PhysicsRunPolicy(write_target_joint=True).validate()
     PhysicsRunPolicy().validate()
+
+
+def test_automatic_trajectory_selection_uses_global_cspace_metric():
+    trajectories = np.asarray(
+        [
+            [[0.0, 0.0], [2.0, 0.0]],
+            [[0.0, 0.0], [0.5, 0.5]],
+            [[0.0, 0.0], [0.1, 0.1]],
+        ]
+    )
+    result = weighted_cspace_path_scores(trajectories, [True, True, False], [2.0, 1.0])
+    assert result["ranked_valid_trajectory_indices"] == [1, 0]
+    assert result["selected_trajectory_index"] == 1
+    assert result["scores_per_trajectory"] == pytest.approx([4.0, np.hypot(1.0, 0.5), np.hypot(0.2, 0.1)])
 
 
 @pytest.mark.parametrize(
