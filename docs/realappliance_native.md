@@ -92,6 +92,11 @@ commands. Contact sensing and contact material assignment cover every rigid body
 in the selected moving component (including fixed handle descendants), not just
 the joint's child body.
 
+Strict execution additionally requires finger contact with the exact rigid body
+that produced the selected GraspGen candidate. Incidental forearm/door contact
+does not satisfy that check. PhysX contact separations are recorded at every
+step and the run fails the penetration audit if the maximum depth exceeds 5 mm.
+
 The waypoint search is a generic AKR-manifold seed. It was added because the
 upstream trajectory optimizer constrains the appliance anchor at the endpoint
 and then filters intermediate anchor drift after optimization. Generating the

@@ -46,6 +46,13 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     result.add_argument(
+        "--interaction-body-path",
+        help=(
+            "Source body selected by the grasp candidate. Finger contact with this "
+            "body is audited separately from incidental robot/component contact."
+        ),
+    )
+    result.add_argument(
         "--joint-type", choices=("revolute", "prismatic"), required=True
     )
     result.add_argument("--joint-axis", required=True)
@@ -67,6 +74,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--camera-distance-multiplier", type=float, default=2.0)
     result.add_argument("--passive-baseline-steps", type=int, default=120)
     result.add_argument("--max-passive-drift-fraction", type=float, default=0.025)
+    result.add_argument("--max-contact-penetration-m", type=float, default=0.005)
     result.add_argument(
         "--joint-friction-candidates",
         default="0,0.05,0.1,0.2,0.5,1,2,5",
@@ -317,6 +325,9 @@ def main() -> None:
     target_body_path = runtime_path(ARGS.moving_body_path)
     component_source_paths = list(dict.fromkeys([ARGS.moving_body_path, *ARGS.contact_body_path]))
     component_body_paths = [runtime_path(path) for path in component_source_paths]
+    interaction_body_path = runtime_path(
+        ARGS.interaction_body_path or ARGS.moving_body_path
+    )
     cameras = {
         "overview": Camera(
             "/World/NativeOverviewCamera", frequency=30, resolution=(640, 480)
@@ -333,11 +344,19 @@ def main() -> None:
         prepare_contact_sensors=True,
         max_contact_count=8192,
     )
+    interaction_contacts = RigidContactView(
+        prim_paths_expr="/World/Franka/panda_*finger",
+        filter_paths_expr=[interaction_body_path],
+        name="native_finger_interaction_contacts",
+        prepare_contact_sensors=True,
+        max_contact_count=1024,
+    )
 
     world.reset()
     appliance = Articulation("/World/Appliance")
     appliance.initialize()
     target_contacts.initialize()
+    interaction_contacts.initialize()
     target_matches = [
         index
         for index, name in enumerate(appliance.dof_names)
@@ -486,10 +505,34 @@ def main() -> None:
         array = np.asarray(matrix, dtype=np.float64)
         return 0.0 if not array.size else float(np.max(np.linalg.norm(array, axis=-1)))
 
+    def interaction_contact_force() -> float:
+        matrix = interaction_contacts.get_contact_force_matrix(dt=1.0 / 120.0)
+        if matrix is None:
+            return 0.0
+        array = np.asarray(matrix, dtype=np.float64)
+        return 0.0 if not array.size else float(np.max(np.linalg.norm(array, axis=-1)))
+
+    def minimum_contact_separation() -> float | None:
+        data = target_contacts.get_contact_force_data(dt=1.0 / 120.0)
+        if data is None:
+            return None
+        distances = np.asarray(data[3], dtype=np.float64).reshape(-1)
+        counts = np.asarray(data[4], dtype=np.int64).reshape(-1)
+        starts = np.asarray(data[5], dtype=np.int64).reshape(-1)
+        active: list[np.ndarray] = []
+        for start, count in zip(starts, counts, strict=True):
+            if count > 0:
+                active.append(distances[start : start + count])
+        if not active:
+            return None
+        return float(np.min(np.concatenate(active)))
+
     def record_step(phase: str, render: bool) -> None:
         nonlocal step_count
         measured_joint, progress = measured_progress()
         force = target_contact_force()
+        interaction_force = interaction_contact_force()
+        minimum_separation = minimum_contact_separation()
         trace.append(
             {
                 "step": step_count,
@@ -497,6 +540,11 @@ def main() -> None:
                 "target_joint_position": measured_joint,
                 "range_fraction": progress,
                 "target_contact_force_n": force,
+                "interaction_contact_force_n": interaction_force,
+                "minimum_contact_separation_m": minimum_separation,
+                "maximum_contact_penetration_m": (
+                    0.0 if minimum_separation is None else max(0.0, -minimum_separation)
+                ),
                 "object_target_was_written": False,
                 "attachment_active": False,
             }
@@ -626,6 +674,17 @@ def main() -> None:
         row["phase"].startswith("OPEN") and row["target_contact_force_n"] > 0.1
         for row in trace
     )
+    open_interaction_contact_steps = sum(
+        row["phase"].startswith("OPEN")
+        and row["interaction_contact_force_n"] > 0.1
+        for row in trace
+    )
+    maximum_contact_penetration = max(
+        row["maximum_contact_penetration_m"] for row in trace
+    )
+    penetration_audit_passed = maximum_contact_penetration <= float(
+        ARGS.max_contact_penetration_m
+    )
     passive_baseline_failed = passive_baseline_drift > float(
         ARGS.max_passive_drift_fraction
     )
@@ -639,6 +698,7 @@ def main() -> None:
         "asset_specific_parameters": False,
         "target_dof_name": ARGS.target_dof_name,
         "moving_component_body_paths": component_body_paths,
+        "interaction_body_path": interaction_body_path,
         "joint_type": ARGS.joint_type,
         "joint_limits": [lower, upper],
         "initial_joint_position": initial_joint,
@@ -655,25 +715,40 @@ def main() -> None:
         "contact_steps": contact_steps,
         "contact_evidence": contact_steps > 0,
         "open_contact_steps": open_contact_steps,
+        "open_interaction_contact_steps": open_interaction_contact_steps,
         "passive_baseline_drift_fraction": passive_baseline_drift,
         "max_passive_drift_fraction": float(ARGS.max_passive_drift_fraction),
         "passive_baseline_failed": passive_baseline_failed,
         "object_joint_commands_issued": 0,
         "object_reset_writes": len(friction_calibration) + 1,
         "attachment_used": False,
-        "penetration_audit_complete": False,
+        "penetration_audit_complete": True,
+        "maximum_contact_penetration_m": maximum_contact_penetration,
+        "max_allowed_contact_penetration_m": float(ARGS.max_contact_penetration_m),
+        "penetration_audit_passed": penetration_audit_passed,
         "dataset_ready": False,
         "friction": friction,
         "joint_friction_calibration": friction_calibration,
         "selected_joint_friction": selected_joint_friction,
         "trace_steps": len(trace),
     }
-    if result["functional_open_success"] and open_contact_steps > 0:
+    result["strict_physical_success"] = bool(
+        result["functional_open_success"]
+        and open_interaction_contact_steps > 0
+        and penetration_audit_passed
+    )
+    if result["strict_physical_success"]:
         result["provisional_physical_success"] = True
-        result["failure_reason"] = "penetration_audit_pending"
+        result["failure_reason"] = None
     elif passive_baseline_failed:
         result["provisional_physical_success"] = False
         result["failure_reason"] = "passive_joint_drift_before_robot_contact"
+    elif not penetration_audit_passed:
+        result["provisional_physical_success"] = False
+        result["failure_reason"] = "contact_penetration_exceeded"
+    elif open_interaction_contact_steps == 0:
+        result["provisional_physical_success"] = False
+        result["failure_reason"] = "no_finger_contact_with_selected_interaction_body"
     else:
         result["provisional_physical_success"] = False
         result["failure_reason"] = "insufficient_opening_or_contact"
