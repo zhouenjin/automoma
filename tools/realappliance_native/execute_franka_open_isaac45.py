@@ -76,6 +76,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-passive-drift-fraction", type=float, default=0.025)
     result.add_argument("--max-contact-penetration-m", type=float, default=0.005)
     result.add_argument(
+        "--abort-after-contact-audit",
+        action="store_true",
+        help=(
+            "Stop after CLOSE when the selected interaction body was never touched "
+            "by a finger or the contact-stage penetration limit was exceeded."
+        ),
+    )
+    result.add_argument(
         "--joint-friction-candidates",
         default="0,0.05,0.1,0.2,0.5,1,2,5",
         help="Ascending generic PhysX joint-friction values used for auto calibration.",
@@ -609,7 +617,25 @@ def main() -> None:
     step_pose("CONTACT", contact_world, orientation, 180, 0.04)
     step_pose("CLOSE", contact_world, orientation, 180, 0.0)
 
-    if ARGS.joint_plan_npz is not None:
+    contact_audit_rows = [
+        row for row in trace if row["phase"] in {"CONTACT", "CLOSE"}
+    ]
+    contact_audit_interaction_steps = sum(
+        row["interaction_contact_force_n"] > 0.1 for row in contact_audit_rows
+    )
+    contact_audit_maximum_penetration = max(
+        row["maximum_contact_penetration_m"] for row in contact_audit_rows
+    )
+    early_abort_reason: str | None = None
+    if ARGS.abort_after_contact_audit:
+        if contact_audit_maximum_penetration > float(
+            ARGS.max_contact_penetration_m
+        ):
+            early_abort_reason = "contact_stage_penetration_exceeded"
+        elif contact_audit_interaction_steps == 0:
+            early_abort_reason = "no_finger_contact_after_close"
+
+    if early_abort_reason is None and ARGS.joint_plan_npz is not None:
         arm_indices = [
             index for index, name in enumerate(franka.dof_names) if name.startswith("panda_joint")
         ]
@@ -631,7 +657,7 @@ def main() -> None:
                 record_step("OPEN_PLAN", render)
             previous = waypoint
         final_arm_target = arm_path[-1].copy()
-    else:
+    elif early_abort_reason is None:
         reference_joint = initial_joint
         no_progress_steps = 0
         best_progress = 0.0
@@ -667,7 +693,7 @@ def main() -> None:
             if no_progress_steps > 420:
                 break
 
-    if ARGS.joint_plan_npz is not None:
+    if early_abort_reason is None and ARGS.joint_plan_npz is not None:
         # Keep the final planned configuration.  Sending the original contact pose
         # through RMPFlow here would command the arm back toward the closed door.
         for _ in range(90):
@@ -682,7 +708,7 @@ def main() -> None:
             render = step_count % int(ARGS.render_stride) == 0
             world.step(render=render)
             record_step("HOLD_PLAN", render)
-    else:
+    elif early_abort_reason is None:
         step_pose("HOLD", target_position, target_orientation, 90, 0.0)
     final_joint, final_fraction = measured_progress()
     maximum_fraction = max(row["range_fraction"] for row in trace)
@@ -733,6 +759,14 @@ def main() -> None:
         "contact_evidence": contact_steps > 0,
         "open_contact_steps": open_contact_steps,
         "open_interaction_contact_steps": open_interaction_contact_steps,
+        "contact_stage_interaction_contact_steps": (
+            contact_audit_interaction_steps
+        ),
+        "contact_stage_maximum_penetration_m": (
+            contact_audit_maximum_penetration
+        ),
+        "contact_stage_audit_enabled": bool(ARGS.abort_after_contact_audit),
+        "contact_stage_early_abort_reason": early_abort_reason,
         "passive_baseline_drift_fraction": passive_baseline_drift,
         "max_passive_drift_fraction": float(ARGS.max_passive_drift_fraction),
         "passive_baseline_failed": passive_baseline_failed,
@@ -760,6 +794,9 @@ def main() -> None:
     elif passive_baseline_failed:
         result["provisional_physical_success"] = False
         result["failure_reason"] = "passive_joint_drift_before_robot_contact"
+    elif early_abort_reason is not None:
+        result["provisional_physical_success"] = False
+        result["failure_reason"] = early_abort_reason
     elif not penetration_audit_passed:
         result["provisional_physical_success"] = False
         result["failure_reason"] = "contact_penetration_exceeded"
