@@ -73,14 +73,16 @@ The executable native path is now:
    body provenance;
 4. call the upstream GraspGen service and retain candidate rank, confidence,
    and source rigid body;
-5. construct a grasp-specific reversed AKR chain from the USD parent/child
+5. use the selected handle body as the grasp target and every other component
+   body as scene-collision context;
+6. construct a grasp-specific reversed AKR chain from the USD parent/child
    anchors and rotations;
-6. inherit AutoMoMa's adjacent-payload collision topology while preserving
+7. inherit AutoMoMa's adjacent-payload collision topology while preserving
    all other robot and component collision checks;
-7. sample the target articulation from closed to the requested fraction, solve
+8. sample the target articulation from closed to the requested fraction, solve
    collision-feasible IK at every sample, and select a continuous path through
    those IK layers;
-8. pass the resulting robot-only path to the physical Isaac executor and audit
+9. pass the resulting robot-only path to the physical Isaac executor and audit
    contact, penetration, object-joint writes, and attachments.
 
 The RealAppliance adapter also performs a pre-episode passive-stability
@@ -96,6 +98,9 @@ Strict execution additionally requires finger contact with the exact rigid body
 that produced the selected GraspGen candidate. Incidental forearm/door contact
 does not satisfy that check. PhysX contact separations are recorded at every
 step and the run fails the penetration audit if the maximum depth exceeds 5 mm.
+An optional fast audit stops after gripper closing when no finger has touched
+the selected interaction body or when the 5 mm threshold is already exceeded.
+This reduces failed-candidate runtime without relaxing the success definition.
 
 The compatibility executor explicitly converts the cuRobo `panda_hand` grasp
 frame into Isaac Sim 4.5 RMPFlow's synthetic `right_gripper` frame. The latter is
@@ -128,6 +133,23 @@ manifold path (44--202 collision-feasible IK solutions per layer) with maximum
 anchor drift `1.674e-5 m`. The physical executor consumes only the seven Franka
 columns from that path; the eighth AKR/object column is never sent to PhysX.
 
+Strict physical replay rejected all three initially tested candidates:
+
+- rank 0 reached only `32.17%`, had zero finger/handle contact during opening,
+  and penetrated the appliance by `16.75 mm`;
+- rank 2 reached only `1.26%`, had zero finger/handle contact, and penetrated by
+  `10.00 mm`;
+- rank 1 eventually reached `100%` with zero robot/component contact for the
+  entire episode, so it was passive opening over the long horizon rather than
+  robot manipulation.
+
+All three are representative failures, not dataset-ready episodes. GraspGen had
+scored the target geometry in isolation, so high confidence did not exclude a
+palm or finger collision with the adjacent door. The native generator now calls
+GraspGen's official point-cloud scene collision filter before IK. In the first
+`055` rerun, `33/200` handle grasps survived a `3 mm` threshold; the rejected
+167 candidates no longer consume AKR or PhysX budget.
+
 ## Paper-version reproducibility
 
 The paper stack is being retained separately from the Isaac Sim 4.5
@@ -144,7 +166,16 @@ PyTorch 2.7.0/cu128, and Warp 1.12.1. Results obtained with the installed Isaac
 Sim 4.5 compatibility executor are explicitly labelled as such and are not
 presented as paper-stack reproduction evidence.
 
-This is planning evidence only. `strict_physical_success` remains false until
-Isaac/PhysX executes robot DOFs only and the contact and penetration audits pass.
-No native success video exists yet and none should be inferred from the planner
+The exact cuRobo, IsaacLab-Arena, and LeRobot source revisions are present on
+the 3090 host. LeRobot was checked out with Git LFS smudging disabled so source
+and metadata can be reproduced without downloading training payloads. The
+pinned RoboTwin URL names the authors' non-public `chang-xinhai/RoboTwin` fork
+and currently returns `Repository not found`; a public revision is not silently
+substituted and reported as exact. Both available GPU hosts expose NVIDIA 535
+drivers, below the upstream recommendation for the Isaac Sim 5.1 camera stack,
+so exact-source retention and Isaac 4.5 compatibility execution remain separate.
+
+No strict native success exists yet. `strict_physical_success` remains false
+until Isaac/PhysX executes robot DOFs only and the contact and penetration
+audits pass; planner feasibility alone is never promoted to dataset-ready data.
 metrics.

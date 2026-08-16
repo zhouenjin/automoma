@@ -102,6 +102,12 @@ def main() -> None:
         component_to_world[:3, :3] = rotation @ source_component_to_world[:3, :3]
         center = np.asarray([x, y, z], dtype=np.float64)
         component_to_world[:3, 3] = center - component_to_world[:3, :3] @ component_center
+        asset_root_transform = component_to_world @ np.linalg.inv(
+            source_component_to_world
+        )
+        root_quaternion_xyzw = Rotation.from_matrix(
+            asset_root_transform[:3, :3]
+        ).as_quat()
         axis = component_to_world[:3, :3] @ axis_component
         axis /= np.linalg.norm(axis)
         pivot = (component_to_world @ pivot_component)[:3]
@@ -124,9 +130,15 @@ def main() -> None:
                 {
                     "search_index": search_index,
                     "candidate_rank": int(candidate["rank"]),
+                    "candidate_source": candidate["source_component"],
                     "graspgen_confidence": float(candidate["graspgen_confidence"]),
                     "staging_center": center.tolist(),
                     "staging_yaw_rad": float(yaw),
+                    "asset_root_translation_m": asset_root_transform[:3, 3].tolist(),
+                    "asset_root_quaternion_wxyz": [
+                        float(root_quaternion_xyzw[3]),
+                        *[float(value) for value in root_quaternion_xyzw[:3]],
+                    ],
                     "start_ik_count": start_count,
                     "goal_ik_count": goal_count,
                     "endpoint_score": int(min(start_count, goal_count)),
@@ -141,6 +153,14 @@ def main() -> None:
         ),
         reverse=True,
     )
+    candidate_queue = []
+    queued_ranks = set()
+    for record in records:
+        rank = record["candidate_rank"]
+        if rank in queued_ranks:
+            continue
+        queued_ranks.add(rank)
+        candidate_queue.append(record)
     report = {
         "schema_version": "automoma.realappliance.fixed_staging_search.v1",
         "provenance": {"pipeline": "automoma_native", "g2_inputs_used": False},
@@ -148,6 +168,8 @@ def main() -> None:
         "joint_path": joint.path,
         "tested_pose_count": search_index,
         "endpoint_reachable_count": len(records),
+        "reachable_candidate_count": len(candidate_queue),
+        "candidate_queue": candidate_queue,
         "results": records,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
