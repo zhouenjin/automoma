@@ -602,6 +602,11 @@ def main() -> int:
     maximum_off_surface_force = 0.0
     maximum_interaction_lead = 0.0
     maximum_contact_interaction_lead = 0.0
+    maximum_probe_fraction = 0.0
+    maximum_opening_finger_a_force = 0.0
+    maximum_opening_finger_b_force = 0.0
+    opening_selected_contact_steps = 0
+    opening_bilateral_contact_steps = 0
     phase = "settle"
     step_count = 0
     control_telemetry: dict[str, Any] = {}
@@ -713,15 +718,15 @@ def main() -> int:
         measured_progress, latest_audit = step_and_record()
         maximum_opening_progress = max(maximum_opening_progress, measured_progress)
         target_audit = latest_audit["spatial_target"]
-        if max(
-            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"]),
-            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
-        ) >= 0.05:
+        finger_a_force = _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"])
+        finger_b_force = _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"])
+        maximum_opening_finger_a_force = max(maximum_opening_finger_a_force, finger_a_force)
+        maximum_opening_finger_b_force = max(maximum_opening_finger_b_force, finger_b_force)
+        if max(finger_a_force, finger_b_force) >= 0.05:
             contact_during_opening = True
-        selected_contact_now = max(
-            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"]),
-            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
-        ) >= 0.05
+        selected_contact_now = max(finger_a_force, finger_b_force) >= 0.05
+        opening_selected_contact_steps += int(selected_contact_now)
+        opening_bilateral_contact_steps += int(min(finger_a_force, finger_b_force) >= 0.05)
         if maximum_opening_progress >= float(task["acceptance_fraction"]):
             opening_termination = "acceptance_reached"
             break
@@ -776,6 +781,7 @@ def main() -> int:
             probe_after_seconds=ARGS.progress_probe_after_seconds,
             ramp_seconds=ARGS.probe_lead_ramp_seconds,
         )
+        maximum_probe_fraction = max(maximum_probe_fraction, probe_fraction)
         probe_enabled = bool(selected_contact_now and probe_fraction > 0.0)
         last_blocking_gates = []
         if base_error > active_base_error_limit_m:
@@ -855,6 +861,12 @@ def main() -> int:
             "maximum_off_selected_surface_force_n": maximum_off_surface_force,
             "maximum_interaction_lead_m": maximum_interaction_lead,
             "maximum_interaction_lead_while_selected_contact_m": maximum_contact_interaction_lead,
+            "maximum_probe_fraction": maximum_probe_fraction,
+            "maximum_opening_finger_a_force_n": maximum_opening_finger_a_force,
+            "maximum_opening_finger_b_force_n": maximum_opening_finger_b_force,
+            "opening_selected_contact_steps": opening_selected_contact_steps,
+            "opening_bilateral_contact_steps": opening_bilateral_contact_steps,
+            "final_control_telemetry": control_telemetry,
             "interaction_lead_limit_m": ARGS.maximum_interaction_lead_m,
             "probe_interaction_lead_limit_m": ARGS.maximum_probe_interaction_lead_m,
             "tracking_limits": {
