@@ -41,17 +41,19 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--joint-axis", required=True)
     result.add_argument("--joint-pivot", required=True)
-    result.add_argument("--contact-center", required=True)
-    result.add_argument("--approach-direction", required=True)
-    result.add_argument("--closing-direction", required=True)
+    result.add_argument("--contact-center")
+    result.add_argument("--approach-direction")
+    result.add_argument("--closing-direction")
+    result.add_argument("--joint-plan-npz", type=Path)
     result.add_argument("--asset-translation", default="0.55,0.0,0.55")
+    result.add_argument("--asset-yaw-rad", type=float, default=0.0)
     result.add_argument("--robot-translation", default="0.10,-0.35,0.0")
     result.add_argument("--precontact-distance-m", type=float, default=0.12)
     result.add_argument("--contact-offset-m", type=float, default=-0.002)
     result.add_argument("--target-fraction", type=float, default=0.80)
     result.add_argument("--acceptance-fraction", type=float, default=0.70)
-    result.add_argument("--friction-multiplier", type=float, default=5.0)
-    result.add_argument("--finger-effort-multiplier", type=float, default=2.0)
+    result.add_argument("--friction-multiplier", type=float, default=1.0)
+    result.add_argument("--finger-effort-multiplier", type=float, default=1.0)
     result.add_argument("--render-stride", type=int, default=3)
     result.add_argument("--camera-distance-multiplier", type=float, default=2.0)
     result.add_argument("--passive-baseline-steps", type=int, default=120)
@@ -104,12 +106,38 @@ def parse_inputs() -> dict[str, np.ndarray]:
     values = {
         "joint_axis": csv_vector(ARGS.joint_axis, 3),
         "joint_pivot": csv_vector(ARGS.joint_pivot, 3),
-        "contact_center": csv_vector(ARGS.contact_center, 3),
-        "approach_direction": csv_vector(ARGS.approach_direction, 3),
-        "closing_direction": csv_vector(ARGS.closing_direction, 3),
         "asset_translation": csv_vector(ARGS.asset_translation, 3),
         "robot_translation": csv_vector(ARGS.robot_translation, 3),
     }
+    if ARGS.joint_plan_npz is None:
+        missing = [
+            name
+            for name in ("contact_center", "approach_direction", "closing_direction")
+            if getattr(ARGS, name) is None
+        ]
+        if missing:
+            raise ValueError(f"missing non-plan contact arguments: {missing}")
+        values.update(
+            {
+                "contact_center": csv_vector(ARGS.contact_center, 3),
+                "approach_direction": csv_vector(ARGS.approach_direction, 3),
+                "closing_direction": csv_vector(ARGS.closing_direction, 3),
+            }
+        )
+    else:
+        plan = np.load(ARGS.joint_plan_npz, allow_pickle=False)
+        path = np.asarray(plan["manifold_path"], dtype=np.float64)
+        start_pose = np.asarray(plan["start_ee_pose"], dtype=np.float64)
+        if path.ndim != 2 or path.shape[0] < 2 or path.shape[1] != 8:
+            raise ValueError(f"expected a fixed-Franka 8D manifold path, got {path.shape}")
+        if start_pose.shape != (7,):
+            raise ValueError(f"expected a 7D start EE pose, got {start_pose.shape}")
+        orientation = Rotation.from_quat(np.roll(start_pose[3:], -1)).as_matrix()
+        values["joint_plan"] = path
+        values["contact_world"] = start_pose[:3]
+        values["contact_orientation"] = start_pose[3:]
+        values["approach_direction"] = orientation[:, 2]
+        values["closing_direction"] = orientation[:, 1]
     values["joint_axis"] = unit(values["joint_axis"])
     values["approach_direction"] = unit(values["approach_direction"])
     closing = values["closing_direction"]
@@ -257,7 +285,13 @@ def main() -> None:
     appliance_xform = SingleXFormPrim(
         "/World/Appliance", name="native_open_appliance_xform"
     )
-    appliance_xform.set_world_pose(position=values["asset_translation"])
+    asset_orientation = np.asarray(
+        [math.cos(0.5 * ARGS.asset_yaw_rad), 0.0, 0.0, math.sin(0.5 * ARGS.asset_yaw_rad)],
+        dtype=np.float64,
+    )
+    appliance_xform.set_world_pose(
+        position=values["asset_translation"], orientation=asset_orientation
+    )
     franka = world.scene.add(
         Franka(
             prim_path="/World/Franka",
@@ -336,13 +370,20 @@ def main() -> None:
             joint_indices=finger_indices,
         )
 
-    contact_source = values["contact_center"] + values["approach_direction"] * float(
-        ARGS.contact_offset_m
-    )
-    contact_world = values["asset_translation"] + contact_source
+    if ARGS.joint_plan_npz is None:
+        contact_source = values["contact_center"] + values["approach_direction"] * float(
+            ARGS.contact_offset_m
+        )
+        contact_world = values["asset_translation"] + contact_source
+    else:
+        contact_world = values["contact_world"] + values["approach_direction"] * float(
+            ARGS.contact_offset_m
+        )
     pivot_world = values["asset_translation"] + values["joint_pivot"]
-    orientation = contact_orientation_wxyz(
-        values["approach_direction"], values["closing_direction"]
+    orientation = (
+        contact_orientation_wxyz(values["approach_direction"], values["closing_direction"])
+        if ARGS.joint_plan_npz is None
+        else values["contact_orientation"]
     )
     precontact_world = contact_world - values["approach_direction"] * float(
         ARGS.precontact_distance_m
@@ -440,53 +481,87 @@ def main() -> None:
     step_pose("CONTACT", contact_world, orientation, 180, 0.04)
     step_pose("CLOSE", contact_world, orientation, 180, 0.0)
 
-    reference_joint = initial_joint
-    no_progress_steps = 0
-    best_progress = 0.0
-    for _ in range(1600):
-        measured_joint, progress = measured_progress()
-        if progress > best_progress + 1.0e-4:
-            best_progress = progress
-            no_progress_steps = 0
-        else:
-            no_progress_steps += 1
-        if progress >= float(ARGS.target_fraction):
-            break
-        maximum_lead = 0.03 * joint_range
-        measured_directed = opening_sign * (measured_joint - initial_joint)
-        reference_directed = opening_sign * (reference_joint - initial_joint)
-        if reference_directed - measured_directed <= maximum_lead:
-            reference_joint += opening_sign * 0.0015 * joint_range
-        reference_joint = min(max(reference_joint, lower), upper)
-        if ARGS.joint_type == "revolute":
-            target_position, target_orientation = rotate_about_axis(
-                contact_world,
-                orientation,
-                pivot_world,
-                values["joint_axis"],
-                reference_joint - initial_joint,
-            )
-        else:
-            target_position = contact_world + values["joint_axis"] * (
-                reference_joint - initial_joint
-            )
-            target_orientation = orientation
-        step_pose("OPEN", target_position, target_orientation, 1, 0.0)
-        if no_progress_steps > 420:
-            break
+    if ARGS.joint_plan_npz is not None:
+        arm_indices = [
+            index for index, name in enumerate(franka.dof_names) if name.startswith("panda_joint")
+        ]
+        if len(arm_indices) != 7:
+            raise RuntimeError(f"expected seven Franka arm joints, got {franka.dof_names}")
+        arm_path = values["joint_plan"][:, :7]
+        previous = np.asarray(franka.get_joint_positions(), dtype=np.float64)[arm_indices]
+        for waypoint in arm_path:
+            for alpha in np.linspace(0.0, 1.0, 24, endpoint=True)[1:]:
+                target = previous + alpha * (waypoint - previous)
+                robot_controller.apply_action(
+                    ArticulationAction(joint_positions=target, joint_indices=arm_indices)
+                )
+                franka.gripper.apply_action(
+                    ArticulationAction(joint_positions=[0.0, 0.0])
+                )
+                render = step_count % int(ARGS.render_stride) == 0
+                world.step(render=render)
+                record_step("OPEN_PLAN", render)
+            previous = waypoint
+        final_arm_target = arm_path[-1].copy()
+    else:
+        reference_joint = initial_joint
+        no_progress_steps = 0
+        best_progress = 0.0
+        for _ in range(1600):
+            measured_joint, progress = measured_progress()
+            if progress > best_progress + 1.0e-4:
+                best_progress = progress
+                no_progress_steps = 0
+            else:
+                no_progress_steps += 1
+            if progress >= float(ARGS.target_fraction):
+                break
+            maximum_lead = 0.03 * joint_range
+            measured_directed = opening_sign * (measured_joint - initial_joint)
+            reference_directed = opening_sign * (reference_joint - initial_joint)
+            if reference_directed - measured_directed <= maximum_lead:
+                reference_joint += opening_sign * 0.0015 * joint_range
+            reference_joint = min(max(reference_joint, lower), upper)
+            if ARGS.joint_type == "revolute":
+                target_position, target_orientation = rotate_about_axis(
+                    contact_world,
+                    orientation,
+                    pivot_world,
+                    values["joint_axis"],
+                    reference_joint - initial_joint,
+                )
+            else:
+                target_position = contact_world + values["joint_axis"] * (
+                    reference_joint - initial_joint
+                )
+                target_orientation = orientation
+            step_pose("OPEN", target_position, target_orientation, 1, 0.0)
+            if no_progress_steps > 420:
+                break
 
-    step_pose(
-        "HOLD",
-        target_position if "target_position" in locals() else contact_world,
-        target_orientation if "target_orientation" in locals() else orientation,
-        90,
-        0.0,
-    )
+    if ARGS.joint_plan_npz is not None:
+        # Keep the final planned configuration.  Sending the original contact pose
+        # through RMPFlow here would command the arm back toward the closed door.
+        for _ in range(90):
+            robot_controller.apply_action(
+                ArticulationAction(
+                    joint_positions=final_arm_target, joint_indices=arm_indices
+                )
+            )
+            franka.gripper.apply_action(
+                ArticulationAction(joint_positions=[0.0, 0.0])
+            )
+            render = step_count % int(ARGS.render_stride) == 0
+            world.step(render=render)
+            record_step("HOLD_PLAN", render)
+    else:
+        step_pose("HOLD", target_position, target_orientation, 90, 0.0)
     final_joint, final_fraction = measured_progress()
     maximum_fraction = max(row["range_fraction"] for row in trace)
     contact_steps = sum(row["target_contact_force_n"] > 0.1 for row in trace)
     open_contact_steps = sum(
-        row["phase"] == "OPEN" and row["target_contact_force_n"] > 0.1 for row in trace
+        row["phase"].startswith("OPEN") and row["target_contact_force_n"] > 0.1
+        for row in trace
     )
     passive_baseline_failed = passive_baseline_drift > float(
         ARGS.max_passive_drift_fraction
@@ -494,6 +569,9 @@ def main() -> None:
     result = {
         "schema_version": 1,
         "executor": "automoma_native_franka_isaac45",
+        "pipeline": "automoma_native",
+        "g2_inputs_used": False,
+        "joint_plan_npz": None if ARGS.joint_plan_npz is None else str(ARGS.joint_plan_npz),
         "asset_usd": str(ARGS.asset_usd.resolve()),
         "asset_specific_parameters": False,
         "target_dof_name": ARGS.target_dof_name,
