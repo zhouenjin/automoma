@@ -75,7 +75,12 @@ from automoma.integrations.realappliance.g2_runtime import (  # noqa: E402
     swerve_inverse_kinematics,
     yaw_from_quaternion_wxyz,
 )
-from automoma.integrations.realappliance.transform_math import matrix_to_pose_wxyz  # noqa: E402
+from automoma.integrations.realappliance.transform_math import (  # noqa: E402
+    invert_rigid,
+    matrix_to_pose_wxyz,
+    quaternion_transform,
+    transform_point,
+)
 
 
 def _as_numpy(value: Any) -> np.ndarray:
@@ -132,7 +137,14 @@ def _configure_appliance_collision(stage: Any) -> dict[str, Any]:
     return {"policy": "global_convex_decomposition", "collision_disabled": False, "meshes": changed}
 
 
-def _bind_contact_friction(stage: Any, finger_paths: Sequence[str], handle_path: str, multiplier: float) -> dict:
+def _bind_contact_friction(
+    stage: Any,
+    finger_paths: Sequence[str],
+    handle_path: str,
+    multiplier: float,
+    *,
+    bind_handle_body: bool,
+) -> dict:
     material = UsdShade.Material.Define(stage, "/World/ExternalFirstContactMaterial")
     physics = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
     coefficient = 0.5 * float(multiplier)
@@ -140,7 +152,10 @@ def _bind_contact_friction(stage: Any, finger_paths: Sequence[str], handle_path:
     physics.CreateDynamicFrictionAttr().Set(coefficient)
     physics.CreateRestitutionAttr().Set(0.0)
     bound = []
-    for path in sorted(set((*finger_paths, handle_path))):
+    requested_paths = [*finger_paths]
+    if bind_handle_body:
+        requested_paths.append(handle_path)
+    for path in sorted(set(requested_paths)):
         prim = stage.GetPrimAtPath(path)
         if not prim.IsValid():
             raise RuntimeError(f"friction target prim does not exist: {path}")
@@ -148,7 +163,17 @@ def _bind_contact_friction(stage: Any, finger_paths: Sequence[str], handle_path:
             material, UsdShade.Tokens.strongerThanDescendants, "physics"
         )
         bound.append(path)
-    return {"multiplier": float(multiplier), "coefficient": coefficient, "bound_paths": bound}
+    return {
+        "multiplier": float(multiplier),
+        "coefficient": coefficient,
+        "bound_paths": bound,
+        "handle_body_bound": bool(bind_handle_body),
+        "scope_reason": (
+            "separate_handle_rigid_body"
+            if bind_handle_body
+            else "handle_geometry_shares_door_body_so_whole_door_material_override_is_forbidden"
+        ),
+    }
 
 
 def _contact_audit(view: RigidContactView | None, dt: float) -> dict[str, Any]:
@@ -186,6 +211,53 @@ def _group_force(audit: dict[str, Any], names: Sequence[str]) -> float:
         (float(force) for path, force in audit["force_by_link_n"].items() if Path(path).name in leaves),
         default=0.0,
     )
+
+
+def _spatial_contact_audit(
+    view: RigidContactView,
+    dt: float,
+    selected_points_world_m: np.ndarray,
+    *,
+    radius_m: float = 0.035,
+) -> dict[str, Any]:
+    raw = view.get_contact_force_data(dt=dt)
+    if raw is None:
+        return {"force_by_link_n": {}, "maximum_off_surface_force_n": 0.0, "contact_records": []}
+    forces_raw, points_raw, _, _, counts_raw, starts_raw = raw
+    forces = np.abs(np.asarray(forces_raw, dtype=np.float64).reshape(-1))
+    points = np.asarray(points_raw, dtype=np.float64).reshape(-1, 3)
+    counts = np.asarray(counts_raw, dtype=np.int64)
+    starts = np.asarray(starts_raw, dtype=np.int64)
+    if counts.ndim == 1:
+        counts = counts[:, None]
+        starts = starts[:, None]
+    paths = list(getattr(view, "_prim_paths", []) or [])
+    selected = np.asarray(selected_points_world_m, dtype=np.float64).reshape(-1, 3)
+    near: dict[str, float] = {}
+    maximum_off_surface = 0.0
+    records = []
+    for robot_index in range(counts.shape[0]):
+        path = paths[robot_index] if robot_index < len(paths) else f"sensor_{robot_index}"
+        for filter_index in range(counts.shape[1]):
+            start = int(starts[robot_index, filter_index])
+            count = int(counts[robot_index, filter_index])
+            for contact_index in range(start, start + count):
+                force = float(forces[contact_index])
+                point = points[contact_index]
+                distance = float(np.min(np.linalg.norm(selected - point[None, :], axis=1)))
+                if distance <= radius_m:
+                    near[path] = max(near.get(path, 0.0), force)
+                else:
+                    maximum_off_surface = max(maximum_off_surface, force)
+                records.append(
+                    {"robot_link": path, "force_n": force, "distance_to_selected_surface_m": distance}
+                )
+    records.sort(key=lambda item: -float(item["force_n"]))
+    return {
+        "force_by_link_n": near,
+        "maximum_off_surface_force_n": maximum_off_surface,
+        "contact_records": records[:12],
+    }
 
 
 def _sample_trajectory(trajectory: np.ndarray, progress: float) -> np.ndarray:
@@ -353,7 +425,14 @@ def main() -> int:
     static_paths = [path for path in all_appliance_rigid_paths if path not in moving_paths]
     finger_names = GRIPPER_LINK_GROUPS[hand]["finger_a"] + GRIPPER_LINK_GROUPS[hand]["finger_b"]
     finger_paths = [f"/World/G2/{name}" for name in finger_names]
-    friction = _bind_contact_friction(world.stage, finger_paths, handle_path, ARGS.friction_multiplier)
+    target_moving_path = _map_source_path(attempt["target_moving_body_source_path"])
+    friction = _bind_contact_friction(
+        world.stage,
+        finger_paths,
+        handle_path,
+        ARGS.friction_multiplier,
+        bind_handle_body=handle_path != target_moving_path,
+    )
     target_contact = RigidContactView(
         prim_paths_expr="/World/G2/*", filter_paths_expr=[handle_path], name="external_first_target_contact",
         prepare_contact_sensors=True, max_contact_count=8192,
@@ -418,23 +497,41 @@ def main() -> int:
         set_camera_view(eye=eye, target=target, camera_prim_path=camera.prim_path)
     recorder = Recorder(ARGS.output_dir, cameras, fps=max(1, ARGS.physics_hz // ARGS.render_stride))
     base_probe = SingleXFormPrim("/World/G2/base_link", name="external_first_base_probe")
+    handle_probe = SingleXFormPrim(handle_path, name="external_first_handle_probe")
+    initial_handle_position, initial_handle_quaternion = handle_probe.get_world_pose()
+    world_from_handle_initial = quaternion_transform(initial_handle_position, initial_handle_quaternion)
+    handle_from_selected_points = [
+        transform_point(invert_rigid(world_from_handle_initial), point)
+        for point in attempt["contact_points_world_m"]
+    ]
 
     maximum_force = 0.0
     minimum_separation = 0.0
     measured_finger_contact = False
     contact_during_opening = False
     maximum_progress = 0.0
+    maximum_off_surface_force = 0.0
     phase = "settle"
     step_count = 0
 
     def step_and_record() -> tuple[float, dict[str, Any]]:
         nonlocal step_count, maximum_force, minimum_separation, measured_finger_contact, maximum_progress
+        nonlocal maximum_off_surface_force
         world.step(render=(step_count % ARGS.render_stride == 0))
         target_audit = _contact_audit(target_contact, dt)
         static_audit = _contact_audit(static_contact, dt)
-        finger_a_force = _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"])
-        finger_b_force = _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"])
+        handle_position, handle_quaternion = handle_probe.get_world_pose()
+        world_from_handle = quaternion_transform(handle_position, handle_quaternion)
+        selected_points_world = np.asarray(
+            [transform_point(world_from_handle, point) for point in handle_from_selected_points]
+        )
+        spatial_audit = _spatial_contact_audit(target_contact, dt, selected_points_world)
+        finger_a_force = _group_force(spatial_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"])
+        finger_b_force = _group_force(spatial_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"])
         measured_finger_contact = measured_finger_contact or max(finger_a_force, finger_b_force) >= 0.05
+        maximum_off_surface_force = max(
+            maximum_off_surface_force, float(spatial_audit["maximum_off_surface_force_n"])
+        )
         force = max(target_audit["maximum_force_n"], static_audit["maximum_force_n"])
         maximum_force = max(maximum_force, force)
         separations = [
@@ -455,10 +552,11 @@ def main() -> int:
                     "finger_b_n": round(finger_b_force, 3),
                     "maximum_force_n": round(maximum_force, 2),
                     "minimum_separation_m": round(minimum_separation, 5),
+                    "off_surface_force_n": round(maximum_off_surface_force, 3),
                 }
             )
         step_count += 1
-        return progress, {"target": target_audit, "static": static_audit}
+        return progress, {"target": target_audit, "spatial_target": spatial_audit, "static": static_audit}
 
     for _ in range(120):
         robot.set_joint_position_targets(trajectory[0, 3:-1].reshape(1, -1), joint_indices=planner_indices)
@@ -508,7 +606,7 @@ def main() -> int:
         robot.set_joint_position_targets(reference[3:-1].reshape(1, -1), joint_indices=planner_indices)
         robot.set_joint_position_targets(gripper_targets(1.0).reshape(1, -1), joint_indices=gripper_indices)
         measured_progress, latest_audit = step_and_record()
-        target_audit = latest_audit["target"]
+        target_audit = latest_audit["spatial_target"]
         if max(
             _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"]),
             _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
@@ -552,6 +650,7 @@ def main() -> int:
             "maximum_contact_force_n": maximum_force,
             "minimum_contact_separation_m": minimum_separation,
             "maximum_penetration_m": penetration,
+            "maximum_off_selected_surface_force_n": maximum_off_surface_force,
             "friction": friction,
             "collision_policy": collision_policy,
             "videos": videos,
