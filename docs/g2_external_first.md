@@ -25,6 +25,13 @@ AutoMoMa remains responsible for:
 3. cuRobo trajectory optimization;
 4. maintaining the end-effector/object relative transform during articulated motion.
 
+The public repository consumes grasp-specific AKR files but does not publish
+the generator or runnable assets. This branch therefore supplies the missing
+mechanical adapter: it appends `EE -> handle -> inverse target joint -> fixed
+object root` to the G2 chain. The AKR coordinate is
+`q_akr = -(q_object - q_initial)`, so keeping the AKR terminal object-root pose
+fixed makes the optimized base/body/arm follow the desired articulation.
+
 The adapter is responsible for:
 
 1. exposing G2 planar base, body, and one selected arm as a cuRobo cspace;

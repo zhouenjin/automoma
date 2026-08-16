@@ -4,6 +4,12 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
+from automoma.integrations.realappliance.akr_adapter import (
+    AkrAttachmentSpec,
+    TransformRPY,
+    build_g2_akr_urdf,
+    make_g2_akr_config,
+)
 from automoma.integrations.realappliance.contracts import ArticulationTaskSpec, JointKind, PhysicsRunPolicy
 from automoma.integrations.realappliance.g2_adapter import (
     Bounds3D,
@@ -92,6 +98,56 @@ def test_base_collision_lattice_covers_bounds():
             min(sum((corner[index] - sphere["center"][index]) ** 2 for index in range(3)) ** 0.5 for sphere in spheres)
             <= radius + 1e-12
         )
+
+
+def test_akr_builder_inverts_target_joint_and_extends_cspace(tmp_path):
+    source = tmp_path / "g2.urdf"
+    planar = tmp_path / "g2_planar.urdf"
+    akr = tmp_path / "g2_akr.urdf"
+    source.write_text(MINIMAL_G2, encoding="utf-8")
+    build_planar_g2_urdf(source, planar)
+    spec = AkrAttachmentSpec(
+        hand=Hand.RIGHT,
+        source_joint_name="door_hinge",
+        joint_kind=JointKind.REVOLUTE,
+        joint_axis=(0.0, 0.0, 2.0),
+        lower_limit=0.0,
+        upper_limit=1.5,
+        initial_position=0.2,
+        ee_to_handle=TransformRPY(),
+        handle_to_joint_at_initial=TransformRPY(xyz=(-0.4, 0.0, 0.0)),
+        joint_at_initial_to_object_root=TransformRPY(),
+    )
+    build_g2_akr_urdf(planar, akr, spec)
+    root = ET.parse(akr).getroot()
+    target = root.find("./joint[@name='automoma_target_joint']")
+    assert target is not None
+    assert target.attrib["type"] == "revolute"
+    assert target.find("axis").attrib["xyz"] == "0 0 1"
+    assert float(target.find("limit").attrib["lower"]) == pytest.approx(-1.3)
+    assert float(target.find("limit").attrib["upper"]) == pytest.approx(0.2)
+    assert spec.akr_position(1.0) == pytest.approx(-0.8)
+
+    base_config = {
+        "robot_cfg": {
+            "kinematics": {
+                "ee_link": "right_gripper_center",
+                "cspace": {
+                    "joint_names": ["base_x", "body_joint"],
+                    "retract_config": [0.0, 0.0],
+                    "null_space_weight": [1.0, 1.0],
+                    "cspace_distance_weight": [1.0, 1.0],
+                    "max_acceleration": [1.0, 1.0],
+                    "max_jerk": [10.0, 10.0],
+                },
+            }
+        }
+    }
+    result = make_g2_akr_config(base_config, akr, spec)
+    kinematics = result["robot_cfg"]["kinematics"]
+    assert kinematics["ee_link"] == "automoma_object_root"
+    assert kinematics["cspace"]["joint_names"][-1] == "automoma_target_joint"
+    assert len(kinematics["cspace"]["joint_names"]) == 3
 
 
 def test_hypothesis_pool_contains_both_hands_without_asset_rules():
