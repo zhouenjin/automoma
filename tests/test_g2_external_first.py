@@ -21,6 +21,7 @@ from automoma.integrations.realappliance.g2_adapter import (
     make_g2_curobo_config,
 )
 from automoma.integrations.realappliance.g2_runtime import (
+    adaptive_interaction_lead_limit_m,
     gripper_targets,
     planar_tracking_twist,
     positive_interaction_lead_m,
@@ -340,6 +341,20 @@ def test_joint_reference_lead_is_measured_at_the_contact_point():
         reference_joint_position=-0.02,
         measured_joint_position=0.0,
     ) == pytest.approx(0.02)
+
+
+def test_static_friction_probe_ramps_metric_lead_instead_of_jumping():
+    arguments = {
+        "physics_hz": 100,
+        "ordinary_limit_m": 0.003,
+        "probe_limit_m": 0.015,
+        "probe_after_seconds": 0.5,
+        "ramp_seconds": 1.0,
+    }
+    assert adaptive_interaction_lead_limit_m(no_progress_steps=50, **arguments) == pytest.approx((0.003, 0.0))
+    assert adaptive_interaction_lead_limit_m(no_progress_steps=100, **arguments) == pytest.approx((0.009, 0.5))
+    assert adaptive_interaction_lead_limit_m(no_progress_steps=150, **arguments) == pytest.approx((0.015, 1.0))
+    assert adaptive_interaction_lead_limit_m(no_progress_steps=500, **arguments) == pytest.approx((0.015, 1.0))
 
 
 @pytest.mark.parametrize(

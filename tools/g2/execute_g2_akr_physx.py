@@ -39,13 +39,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-distance-multiplier", type=float, default=2.0)
     parser.add_argument("--maximum-opening-seconds", type=float, default=30.0)
     parser.add_argument("--maximum-interaction-lead-m", type=float, default=0.003)
-    parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.005)
+    parser.add_argument("--maximum-probe-interaction-lead-m", type=float, default=0.015)
+    parser.add_argument("--progress-probe-after-seconds", type=float, default=0.5)
+    parser.add_argument("--probe-lead-ramp-seconds", type=float, default=1.0)
+    parser.add_argument("--progress-epsilon-fraction", type=float, default=0.0005)
+    parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.008)
     parser.add_argument("--maximum-base-yaw-error-rad", type=float, default=0.02)
     parser.add_argument("--maximum-robot-joint-tracking-error-rad", type=float, default=0.03)
     return parser.parse_args()
 
 
 ARGS = _parse_args()
+if ARGS.physics_hz <= 0:
+    raise ValueError("--physics-hz must be positive")
+if ARGS.render_stride <= 0:
+    raise ValueError("--render-stride must be positive")
+if ARGS.maximum_interaction_lead_m < 0.0:
+    raise ValueError("--maximum-interaction-lead-m must be non-negative")
+if ARGS.maximum_probe_interaction_lead_m < ARGS.maximum_interaction_lead_m:
+    raise ValueError("--maximum-probe-interaction-lead-m must not be smaller than the ordinary lead limit")
+if ARGS.progress_probe_after_seconds < 0.0 or ARGS.probe_lead_ramp_seconds <= 0.0:
+    raise ValueError("probe timing must be non-negative with a positive ramp duration")
+if ARGS.progress_epsilon_fraction <= 0.0:
+    raise ValueError("--progress-epsilon-fraction must be positive")
 APP = SimulationApp({"headless": True, "width": 640, "height": 480, "renderer": "RayTracedLighting"})
 
 from isaacsim.core.api import World  # noqa: E402
@@ -71,6 +87,7 @@ from automoma.integrations.realappliance.g2_runtime import (  # noqa: E402
     STEERING_JOINT_NAMES,
     WHEEL_JOINT_NAMES,
     actuator_groups,
+    adaptive_interaction_lead_limit_m,
     gripper_targets,
     named_indices,
     normalize_angle,
@@ -603,6 +620,8 @@ def main() -> int:
     nominal_steps = max(1, int(math.ceil(duration * ARGS.physics_hz)))
     reference_progress = 0.0
     stalled_steps = 0
+    best_opening_progress = 0.0
+    no_object_progress_steps = 0
     latest_audit: dict[str, Any] = {}
     for _ in range(nominal_steps + ARGS.physics_hz * 8):
         reference = _sample_trajectory(trajectory, reference_progress)
@@ -629,6 +648,10 @@ def main() -> int:
             _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
         ) >= 0.05:
             contact_during_opening = True
+        selected_contact_now = max(
+            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"]),
+            _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
+        ) >= 0.05
         if maximum_progress >= float(task["acceptance_fraction"]):
             break
         akr_start = trajectory[0, -1]
@@ -650,6 +673,22 @@ def main() -> int:
             measured_joint_position=measured_joint_position,
         )
         maximum_interaction_lead = max(maximum_interaction_lead, interaction_lead_m)
+        if measured_progress >= best_opening_progress + ARGS.progress_epsilon_fraction:
+            best_opening_progress = measured_progress
+            no_object_progress_steps = 0
+        elif selected_contact_now:
+            no_object_progress_steps += 1
+        else:
+            no_object_progress_steps = 0
+        active_lead_limit_m, probe_fraction = adaptive_interaction_lead_limit_m(
+            no_progress_steps=no_object_progress_steps,
+            physics_hz=ARGS.physics_hz,
+            ordinary_limit_m=ARGS.maximum_interaction_lead_m,
+            probe_limit_m=ARGS.maximum_probe_interaction_lead_m,
+            probe_after_seconds=ARGS.progress_probe_after_seconds,
+            ramp_seconds=ARGS.probe_lead_ramp_seconds,
+        )
+        probe_enabled = bool(selected_contact_now and probe_fraction > 0.0)
         measured_robot_joints = _as_numpy(robot.get_joint_positions(joint_indices=planner_indices)).reshape(-1)
         robot_joint_error = float(np.max(np.abs(measured_robot_joints - reference[3:-1])))
         control_telemetry.update(
@@ -660,13 +699,18 @@ def main() -> int:
                 "base_error_m": round(base_error, 5),
                 "base_yaw_error_rad": round(yaw_error, 5),
                 "robot_joint_error_rad": round(robot_joint_error, 5),
+                "probe_enabled": probe_enabled,
+                "probe_fraction": round(probe_fraction, 4),
+                "active_lead_limit_m": round(active_lead_limit_m, 5),
+                "no_object_progress_steps": no_object_progress_steps,
             }
         )
         can_advance = (
             base_error <= ARGS.maximum_base_tracking_error_m
             and yaw_error <= ARGS.maximum_base_yaw_error_rad
             and robot_joint_error <= ARGS.maximum_robot_joint_tracking_error_rad
-            and interaction_lead_m <= ARGS.maximum_interaction_lead_m
+            and interaction_lead_m <= active_lead_limit_m
+            and selected_contact_now
         )
         if can_advance and reference_progress < 1.0:
             reference_progress = min(1.0, reference_progress + 1.0 / nominal_steps)
@@ -701,6 +745,7 @@ def main() -> int:
             "maximum_off_selected_surface_force_n": maximum_off_surface_force,
             "maximum_interaction_lead_m": maximum_interaction_lead,
             "interaction_lead_limit_m": ARGS.maximum_interaction_lead_m,
+            "probe_interaction_lead_limit_m": ARGS.maximum_probe_interaction_lead_m,
             "friction": friction,
             "collision_policy": collision_policy,
             "videos": videos,

@@ -147,6 +147,36 @@ def positive_interaction_lead_m(
     return float(2.0 * radius * math.sin(min(math.pi, lead) / 2.0))
 
 
+def adaptive_interaction_lead_limit_m(
+    *,
+    no_progress_steps: int,
+    physics_hz: int,
+    ordinary_limit_m: float,
+    probe_limit_m: float,
+    probe_after_seconds: float,
+    ramp_seconds: float,
+) -> tuple[float, float]:
+    """Ramp contact-point lead only after sustained, contact-preserving stall.
+
+    The caller owns contact detection and resets ``no_progress_steps`` whenever
+    the selected contact is lost or the target articulation advances.
+    """
+
+    if physics_hz <= 0:
+        raise ValueError("physics_hz must be positive")
+    if no_progress_steps < 0:
+        raise ValueError("no_progress_steps must be non-negative")
+    if ordinary_limit_m < 0.0 or probe_limit_m < ordinary_limit_m:
+        raise ValueError("interaction lead limits must be ordered and non-negative")
+    if probe_after_seconds < 0.0 or ramp_seconds <= 0.0:
+        raise ValueError("probe timing must be non-negative with a positive ramp duration")
+    start_steps = int(probe_after_seconds * physics_hz)
+    ramp_steps = max(1, int(ramp_seconds * physics_hz))
+    fraction = float(np.clip((no_progress_steps - start_steps) / ramp_steps, 0.0, 1.0))
+    limit = ordinary_limit_m + fraction * (probe_limit_m - ordinary_limit_m)
+    return float(limit), fraction
+
+
 def yaw_from_quaternion_wxyz(quaternion: Sequence[float]) -> float:
     w, x, y, z = np.asarray(quaternion, dtype=np.float64).reshape(4)
     return float(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
