@@ -33,6 +33,7 @@ from automoma.integrations.realappliance.g2_runtime import (
     swerve_inverse_kinematics,
 )
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
+from automoma.integrations.realappliance.physical_search import enumerate_physical_trials
 from automoma.integrations.realappliance.transform_math import (
     axis_motion_transform,
     matrix_to_pose_wxyz,
@@ -338,6 +339,49 @@ def test_automatic_trajectory_selection_uses_global_cspace_metric():
     assert result["ranked_valid_trajectory_indices"] == [1, 0]
     assert result["selected_trajectory_index"] == 1
     assert result["scores_per_trajectory"] == pytest.approx([4.0, np.hypot(1.0, 0.5), np.hypot(0.2, 0.1)])
+
+
+def test_physical_search_expands_automatic_candidate_and_path_order(tmp_path):
+    report_path = tmp_path / "report.json"
+    report = {
+        "attempts": [
+            {
+                "attempt_id": "rank1",
+                "automatic_rank": 1,
+                "pre_ik_score": 9.0,
+                "hand": "left",
+                "capture_depth_fraction": 0.35,
+                "success": True,
+                "planning": {
+                    "automatic_trajectory_selection": {
+                        "ranked_valid_trajectory_indices": [2, 0],
+                        "scores_per_trajectory": [2.0, 99.0, 1.0],
+                    }
+                },
+            },
+            {
+                "attempt_id": "rank0",
+                "automatic_rank": 0,
+                "pre_ik_score": 5.0,
+                "hand": "right",
+                "capture_depth_fraction": 0.20,
+                "success": True,
+                "planning": {
+                    "automatic_trajectory_selection": {
+                        "ranked_valid_trajectory_indices": [1],
+                        "scores_per_trajectory": [99.0, 3.0],
+                    }
+                },
+            },
+            {"attempt_id": "failed", "success": False},
+        ]
+    }
+    trials = enumerate_physical_trials(report, report_path=report_path)
+    assert [(trial.attempt_id, trial.trajectory_index) for trial in trials] == [
+        ("rank0", 1),
+        ("rank1", 2),
+        ("rank1", 0),
+    ]
 
 
 def test_g2_runtime_maps_planar_twist_to_four_swerve_modules():

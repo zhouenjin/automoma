@@ -36,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gripper-effort-multiplier", type=float, default=2.0)
     parser.add_argument("--planner-effort-multiplier", type=float, default=1.5)
     parser.add_argument("--base-effort-multiplier", type=float, default=1.5)
-    parser.add_argument("--base-position-gain", type=float, default=3.0)
+    parser.add_argument("--base-position-gain", type=float, default=1.5)
     parser.add_argument("--base-yaw-gain", type=float, default=1.5)
     parser.add_argument("--maximum-penetration-m", type=float, default=0.003)
     parser.add_argument("--maximum-contact-force-n", type=float, default=250.0)
