@@ -181,7 +181,7 @@ def _plan_augmented_trajectory(
     result_report = {
         "pair_count": int(start.shape[0]),
         "successful_plans": int(success.sum().item()),
-        "status": str(result.status),
+        "status": str(getattr(result, "status", "not_exposed_by_trajopt_result")),
         "terminal_fk_audit": audit,
     }
     tensors = {
