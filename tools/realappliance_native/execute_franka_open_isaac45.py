@@ -154,10 +154,23 @@ def parse_inputs() -> dict[str, np.ndarray]:
             raise ValueError(f"expected a fixed-Franka 8D manifold path, got {path.shape}")
         if start_pose.shape != (7,):
             raise ValueError(f"expected a 7D start EE pose, got {start_pose.shape}")
-        orientation = Rotation.from_quat(np.roll(start_pose[3:], -1)).as_matrix()
+        hand_rotation = Rotation.from_quat(np.roll(start_pose[3:], -1))
+        orientation = hand_rotation.as_matrix()
+        # cuRobo plans panda_hand, whereas Isaac Sim 4.5 RMPFlow controls the
+        # synthetic right_gripper frame.  In Lula's Franka URDF right_gripper is
+        # +100 mm along hand Z and rotated pi around hand Z.
+        right_gripper_rotation = hand_rotation * Rotation.from_rotvec(
+            np.asarray([0.0, 0.0, math.pi])
+        )
+        right_gripper_position = start_pose[:3] + hand_rotation.apply(
+            np.asarray([0.0, 0.0, 0.1])
+        )
         values["joint_plan"] = path
-        values["contact_world"] = start_pose[:3]
-        values["contact_orientation"] = start_pose[3:]
+        values["hand_contact_world"] = start_pose[:3]
+        values["contact_world"] = right_gripper_position
+        values["contact_orientation"] = np.roll(
+            right_gripper_rotation.as_quat(), 1
+        )
         values["approach_direction"] = orientation[:, 2]
         values["closing_direction"] = orientation[:, 1]
     values["joint_axis"] = unit(values["joint_axis"])
@@ -475,7 +488,11 @@ def main() -> None:
     camera_specs = {
         "overview": (np.array([-1.2, -1.8, 1.8]), np.array([0.35, -0.05, 0.65])),
         "side": (np.array([1.4, -1.2, 1.15]), contact_world),
-        "contact": (contact_world + np.array([-0.65, -0.75, 0.45]), contact_world),
+        "contact": (
+            values.get("hand_contact_world", contact_world)
+            + np.array([-0.65, -0.75, 0.45]),
+            values.get("hand_contact_world", contact_world),
+        ),
     }
     for name, camera in cameras.items():
         camera.initialize()

@@ -97,6 +97,12 @@ that produced the selected GraspGen candidate. Incidental forearm/door contact
 does not satisfy that check. PhysX contact separations are recorded at every
 step and the run fails the penetration audit if the maximum depth exceeds 5 mm.
 
+The compatibility executor explicitly converts the cuRobo `panda_hand` grasp
+frame into Isaac Sim 4.5 RMPFlow's synthetic `right_gripper` frame. The latter is
+100 mm along hand Z and rotated 180 degrees around hand Z. Passing the hand pose
+directly to RMPFlow is invalid and previously produced a 12.99 mm arm/component
+penetration; that run is retained as a failure case, not success evidence.
+
 The waypoint search is a generic AKR-manifold seed. It was added because the
 upstream trajectory optimizer constrains the appliance anchor at the endpoint
 and then filters intermediate anchor drift after optimization. Generating the
