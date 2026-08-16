@@ -38,6 +38,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-contact-force-n", type=float, default=250.0)
     parser.add_argument("--camera-distance-multiplier", type=float, default=2.0)
     parser.add_argument("--maximum-opening-seconds", type=float, default=30.0)
+    parser.add_argument("--maximum-interaction-lead-m", type=float, default=0.003)
+    parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.005)
+    parser.add_argument("--maximum-base-yaw-error-rad", type=float, default=0.02)
+    parser.add_argument("--maximum-robot-joint-tracking-error-rad", type=float, default=0.03)
     return parser.parse_args()
 
 
@@ -72,6 +76,7 @@ from automoma.integrations.realappliance.g2_runtime import (  # noqa: E402
     normalize_angle,
     planar_tracking_twist,
     planner_robot_joint_names,
+    positive_interaction_lead_m,
     swerve_inverse_kinematics,
     yaw_from_quaternion_wxyz,
 )
@@ -520,8 +525,10 @@ def main() -> int:
     contact_during_opening = False
     maximum_progress = 0.0
     maximum_off_surface_force = 0.0
+    maximum_interaction_lead = 0.0
     phase = "settle"
     step_count = 0
+    control_telemetry: dict[str, Any] = {}
 
     def step_and_record() -> tuple[float, dict[str, Any]]:
         nonlocal step_count, maximum_force, minimum_separation, measured_finger_contact, maximum_progress
@@ -562,6 +569,7 @@ def main() -> int:
                     "maximum_force_n": round(maximum_force, 2),
                     "minimum_separation_m": round(minimum_separation, 5),
                     "off_surface_force_n": round(maximum_off_surface_force, 3),
+                    **control_telemetry,
                 }
             )
         step_count += 1
@@ -626,8 +634,39 @@ def main() -> int:
         akr_start = trajectory[0, -1]
         akr_goal = trajectory[-1, -1]
         expected_progress = float(task["planning_fraction"]) * (reference[-1] - akr_start) / (akr_goal - akr_start)
+        reference_joint_position = float(task["initial_position"]) + expected_progress * (
+            _open_limit(task) - float(task["initial_position"])
+        )
+        measured_joint_position = float(task["initial_position"]) + measured_progress * (
+            _open_limit(task) - float(task["initial_position"])
+        )
+        interaction_lead_m = positive_interaction_lead_m(
+            joint_kind=task["joint_kind"],
+            joint_axis_world=task["axis"],
+            joint_pivot_world_m=task["pivot"],
+            contact_world_m=contact_world,
+            opening_delta=_open_limit(task) - float(task["initial_position"]),
+            reference_joint_position=reference_joint_position,
+            measured_joint_position=measured_joint_position,
+        )
+        maximum_interaction_lead = max(maximum_interaction_lead, interaction_lead_m)
+        measured_robot_joints = _as_numpy(robot.get_joint_positions(joint_indices=planner_indices)).reshape(-1)
+        robot_joint_error = float(np.max(np.abs(measured_robot_joints - reference[3:-1])))
+        control_telemetry.update(
+            {
+                "reference_progress": round(reference_progress, 4),
+                "expected_object_progress": round(expected_progress, 4),
+                "interaction_lead_m": round(interaction_lead_m, 5),
+                "base_error_m": round(base_error, 5),
+                "base_yaw_error_rad": round(yaw_error, 5),
+                "robot_joint_error_rad": round(robot_joint_error, 5),
+            }
+        )
         can_advance = (
-            base_error <= 0.04 and yaw_error <= 0.10 and expected_progress <= measured_progress + 0.08
+            base_error <= ARGS.maximum_base_tracking_error_m
+            and yaw_error <= ARGS.maximum_base_yaw_error_rad
+            and robot_joint_error <= ARGS.maximum_robot_joint_tracking_error_rad
+            and interaction_lead_m <= ARGS.maximum_interaction_lead_m
         )
         if can_advance and reference_progress < 1.0:
             reference_progress = min(1.0, reference_progress + 1.0 / nominal_steps)
@@ -660,6 +699,8 @@ def main() -> int:
             "minimum_contact_separation_m": minimum_separation,
             "maximum_penetration_m": penetration,
             "maximum_off_selected_surface_force_n": maximum_off_surface_force,
+            "maximum_interaction_lead_m": maximum_interaction_lead,
+            "interaction_lead_limit_m": ARGS.maximum_interaction_lead_m,
             "friction": friction,
             "collision_policy": collision_policy,
             "videos": videos,

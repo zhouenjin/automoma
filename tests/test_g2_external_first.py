@@ -23,6 +23,7 @@ from automoma.integrations.realappliance.g2_adapter import (
 from automoma.integrations.realappliance.g2_runtime import (
     gripper_targets,
     planar_tracking_twist,
+    positive_interaction_lead_m,
     swerve_inverse_kinematics,
 )
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
@@ -317,6 +318,28 @@ def test_g2_runtime_maps_planar_twist_to_four_swerve_modules():
     assert yaw_error == pytest.approx(0.5)
     assert gripper_targets(0.0) == pytest.approx((0.0,) * 6)
     assert gripper_targets(1.0) == pytest.approx((-0.85, -0.85, 0.85, 0.85, 0.85, 0.85))
+
+
+def test_joint_reference_lead_is_measured_at_the_contact_point():
+    revolute = positive_interaction_lead_m(
+        joint_kind="revolute",
+        joint_axis_world=(0.0, 0.0, 1.0),
+        joint_pivot_world_m=(0.0, 0.0, 0.0),
+        contact_world_m=(0.5, 0.0, 0.0),
+        opening_delta=1.0,
+        reference_joint_position=0.1,
+        measured_joint_position=0.0,
+    )
+    assert revolute == pytest.approx(2.0 * 0.5 * np.sin(0.05))
+    assert positive_interaction_lead_m(
+        joint_kind="prismatic",
+        joint_axis_world=(1.0, 0.0, 0.0),
+        joint_pivot_world_m=(0.0, 0.0, 0.0),
+        contact_world_m=(0.0, 0.0, 0.0),
+        opening_delta=-1.0,
+        reference_joint_position=-0.02,
+        measured_joint_position=0.0,
+    ) == pytest.approx(0.02)
 
 
 @pytest.mark.parametrize(

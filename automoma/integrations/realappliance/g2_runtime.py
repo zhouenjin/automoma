@@ -116,6 +116,37 @@ def normalize_angle(angle_rad: float) -> float:
     return float((float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi)
 
 
+def positive_interaction_lead_m(
+    *,
+    joint_kind: str,
+    joint_axis_world: Sequence[float],
+    joint_pivot_world_m: Sequence[float],
+    contact_world_m: Sequence[float],
+    opening_delta: float,
+    reference_joint_position: float,
+    measured_joint_position: float,
+) -> float:
+    """Convert positive articulation-reference lead into contact-point metres."""
+
+    direction = 1.0 if float(opening_delta) >= 0.0 else -1.0
+    lead = max(0.0, direction * (float(reference_joint_position) - float(measured_joint_position)))
+    if joint_kind == "prismatic":
+        return lead
+    if joint_kind != "revolute":
+        raise ValueError(f"unsupported joint kind: {joint_kind}")
+    axis = np.asarray(joint_axis_world, dtype=np.float64).reshape(3)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1.0e-12:
+        raise ValueError("joint axis must be nonzero")
+    axis /= axis_norm
+    radial = np.asarray(contact_world_m, dtype=np.float64).reshape(3) - np.asarray(
+        joint_pivot_world_m, dtype=np.float64
+    ).reshape(3)
+    radial -= axis * float(np.dot(axis, radial))
+    radius = float(np.linalg.norm(radial))
+    return float(2.0 * radius * math.sin(min(math.pi, lead) / 2.0))
+
+
 def yaw_from_quaternion_wxyz(quaternion: Sequence[float]) -> float:
     w, x, y, z = np.asarray(quaternion, dtype=np.float64).reshape(4)
     return float(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
