@@ -297,19 +297,27 @@ class Recorder:
         self.cameras = cameras
         self.fps = fps
         self.frame_count = 0
+        self.skipped_empty_frames = 0
         for name in (*cameras, "multiview"):
             (root / "frames" / name).mkdir(parents=True, exist_ok=True)
 
-    def capture(self, telemetry: dict[str, Any]) -> None:
-        images = {}
+    def capture(self, telemetry: dict[str, Any]) -> bool:
+        arrays = {}
         for name, camera in self.cameras.items():
             rgba = camera.get_rgba()
             if rgba is None:
-                raise RuntimeError(f"camera returned no frame: {name}")
+                self.skipped_empty_frames += 1
+                return False
             array = np.asarray(rgba)
+            if array.ndim != 3 or array.shape[0] == 0 or array.shape[1] == 0 or array.shape[2] < 3:
+                self.skipped_empty_frames += 1
+                return False
             if array.dtype != np.uint8:
                 scale = 255.0 if float(np.max(array, initial=0.0)) <= 1.0 else 1.0
                 array = np.clip(array * scale, 0, 255).astype(np.uint8)
+            arrays[name] = array[..., :3]
+        images = {}
+        for name, array in arrays.items():
             image = Image.fromarray(array[..., :3], mode="RGB")
             image.save(self.root / "frames" / name / f"frame_{self.frame_count:06d}.png")
             images[name] = image
@@ -327,6 +335,7 @@ class Recorder:
         with (self.root / "telemetry.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({"frame": self.frame_count, **telemetry}, sort_keys=True) + "\n")
         self.frame_count += 1
+        return True
 
     def encode(self) -> dict[str, str]:
         outputs = {}
@@ -655,6 +664,8 @@ def main() -> int:
             "collision_policy": collision_policy,
             "videos": videos,
             "step_count": step_count,
+            "recorded_frame_count": recorder.frame_count,
+            "skipped_empty_camera_frames": recorder.skipped_empty_frames,
             "failure_reason": None if strict_success else "strict_physical_contract_not_met",
         }
     )
