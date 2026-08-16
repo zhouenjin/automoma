@@ -34,6 +34,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--render-stride", type=int, default=4)
     parser.add_argument("--friction-multiplier", type=float, default=5.0)
     parser.add_argument("--gripper-effort-multiplier", type=float, default=2.0)
+    parser.add_argument("--planner-effort-multiplier", type=float, default=1.5)
     parser.add_argument("--maximum-penetration-m", type=float, default=0.003)
     parser.add_argument("--maximum-contact-force-n", type=float, default=250.0)
     parser.add_argument("--camera-distance-multiplier", type=float, default=2.0)
@@ -62,6 +63,8 @@ if ARGS.progress_probe_after_seconds < 0.0 or ARGS.probe_lead_ramp_seconds <= 0.
     raise ValueError("probe timing must be non-negative with a positive ramp duration")
 if ARGS.progress_epsilon_fraction <= 0.0:
     raise ValueError("--progress-epsilon-fraction must be positive")
+if not math.isfinite(ARGS.planner_effort_multiplier) or ARGS.planner_effort_multiplier <= 0.0:
+    raise ValueError("--planner-effort-multiplier must be finite and positive")
 APP = SimulationApp({"headless": True, "width": 640, "height": 480, "renderer": "RayTracedLighting"})
 
 from isaacsim.core.api import World  # noqa: E402
@@ -135,6 +138,39 @@ def _anchor_body_to_world(stage: Any, body_path: str, anchor_path: str) -> None:
     anchor.CreateLocalRot0Attr(Gf.Quatf(float(rotation.GetReal()), Gf.Vec3f(*rotation.GetImaginary())))
     anchor.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
     anchor.CreateLocalRot1Attr(Gf.Quatf(1.0, Gf.Vec3f(0.0, 0.0, 0.0)))
+
+
+def _scale_authored_joint_efforts(
+    stage: Any, joint_names: Sequence[str], multiplier: float,
+) -> list[dict[str, Any]]:
+    """Scale the supplied robot's authored drive limits without hardcoded torques."""
+
+    wanted = set(joint_names)
+    records = []
+    for prim in stage.Traverse():
+        if prim.GetName() not in wanted:
+            continue
+        for drive_kind in ("angular", "linear"):
+            attribute = prim.GetAttribute(f"drive:{drive_kind}:physics:maxForce")
+            if not attribute.IsValid() or not attribute.HasAuthoredValueOpinion():
+                continue
+            authored = attribute.Get()
+            if authored is None or not math.isfinite(float(authored)):
+                continue
+            scaled = float(authored) * float(multiplier)
+            attribute.Set(scaled)
+            records.append(
+                {
+                    "joint_name": prim.GetName(),
+                    "drive_kind": drive_kind,
+                    "authored_max_force": float(authored),
+                    "scaled_max_force": scaled,
+                }
+            )
+    missing = wanted - {record["joint_name"] for record in records}
+    if missing:
+        raise RuntimeError(f"G2 planner joints are missing authored drive effort limits: {sorted(missing)}")
+    return records
 
 
 def _configure_appliance_collision(stage: Any) -> dict[str, Any]:
@@ -485,13 +521,17 @@ def main() -> int:
         for name, (eye, _) in camera_definitions.items()
     }
 
+    planner_names = planner_robot_joint_names(hand)
+    planner_effort = _scale_authored_joint_efforts(
+        world.stage, planner_names, ARGS.planner_effort_multiplier,
+    )
+
     world.reset()
     robot = Articulation("/World/G2/base_link")
     robot.initialize()
     appliance = Articulation("/World/Appliance")
     appliance.initialize()
     robot_names = list(robot.dof_names)
-    planner_names = planner_robot_joint_names(hand)
     planner_indices = named_indices(planner_names, robot_names)
     gripper_indices = named_indices(GRIPPER_JOINT_NAMES[hand], robot_names)
     steering_indices = named_indices(STEERING_JOINT_NAMES, robot_names)
@@ -785,6 +825,10 @@ def main() -> int:
             "interaction_lead_limit_m": ARGS.maximum_interaction_lead_m,
             "probe_interaction_lead_limit_m": ARGS.maximum_probe_interaction_lead_m,
             "friction": friction,
+            "planner_effort": {
+                "multiplier": ARGS.planner_effort_multiplier,
+                "drives": planner_effort,
+            },
             "collision_policy": collision_policy,
             "videos": videos,
             "step_count": step_count,
