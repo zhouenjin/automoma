@@ -83,6 +83,15 @@ The executable native path is now:
 8. pass the resulting robot-only path to the physical Isaac executor and audit
    contact, penetration, object-joint writes, and attachments.
 
+The RealAppliance adapter also performs a pre-episode passive-stability
+calibration. It tests an ascending, asset-independent list of PhysX joint
+friction coefficients and retains the smallest value that keeps the closed
+joint below the 2.5% drift threshold. Reset writes used by this calibration are
+recorded separately; the manipulation episode still forbids object-joint target
+commands. Contact sensing and contact material assignment cover every rigid body
+in the selected moving component (including fixed handle descendants), not just
+the joint's child body.
+
 The waypoint search is a generic AKR-manifold seed. It was added because the
 upstream trajectory optimizer constrains the appliance anchor at the endpoint
 and then filters intermediate anchor drift after optimization. Generating the

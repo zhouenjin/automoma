@@ -37,6 +37,15 @@ def parser() -> argparse.ArgumentParser:
         help="Source path below /World, e.g. /World/part_03",
     )
     result.add_argument(
+        "--contact-body-path",
+        action="append",
+        default=[],
+        help=(
+            "Source rigid body path belonging to the moving component. Repeat for "
+            "the door, handle, and other fixed descendants."
+        ),
+    )
+    result.add_argument(
         "--joint-type", choices=("revolute", "prismatic"), required=True
     )
     result.add_argument("--joint-axis", required=True)
@@ -58,6 +67,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--camera-distance-multiplier", type=float, default=2.0)
     result.add_argument("--passive-baseline-steps", type=int, default=120)
     result.add_argument("--max-passive-drift-fraction", type=float, default=0.025)
+    result.add_argument(
+        "--joint-friction-candidates",
+        default="0,0.05,0.1,0.2,0.5,1,2,5",
+        help="Ascending generic PhysX joint-friction values used for auto calibration.",
+    )
     result.add_argument(
         "--headless", action=argparse.BooleanOptionalAction, default=True
     )
@@ -183,7 +197,7 @@ def runtime_path(source_path: str) -> str:
 
 
 def apply_contact_material(
-    stage: Any, target_path: str, multiplier: float
+    stage: Any, target_paths: list[str], multiplier: float
 ) -> dict[str, Any]:
     material = UsdShade.Material.Define(stage, "/World/NativeOpenContactMaterial")
     physics = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
@@ -195,7 +209,7 @@ def apply_contact_material(
     candidates = [
         "/World/Franka/panda_leftfinger",
         "/World/Franka/panda_rightfinger",
-        target_path,
+        *target_paths,
     ]
     bound: list[str] = []
     for path in candidates:
@@ -301,6 +315,8 @@ def main() -> None:
     )
 
     target_body_path = runtime_path(ARGS.moving_body_path)
+    component_source_paths = list(dict.fromkeys([ARGS.moving_body_path, *ARGS.contact_body_path]))
+    component_body_paths = [runtime_path(path) for path in component_source_paths]
     cameras = {
         "overview": Camera(
             "/World/NativeOverviewCamera", frequency=30, resolution=(640, 480)
@@ -312,7 +328,7 @@ def main() -> None:
     }
     target_contacts = RigidContactView(
         prim_paths_expr="/World/Franka/*",
-        filter_paths_expr=[target_body_path],
+        filter_paths_expr=component_body_paths,
         name="native_franka_target_contacts",
         prepare_contact_sensors=True,
         max_contact_count=8192,
@@ -334,27 +350,74 @@ def main() -> None:
     target_index = target_matches[0]
     limits = np.asarray(appliance.get_dof_limits(), dtype=np.float64).reshape(-1, 2)
     lower, upper = map(float, limits[target_index])
-    initial_joint = float(
+    measured_initial_joint = float(
         np.asarray(appliance.get_joint_positions(), dtype=np.float64).reshape(-1)[
             target_index
         ]
     )
     if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
         raise RuntimeError(f"invalid target joint limits: {(lower, upper)}")
-    if abs(upper - initial_joint) >= abs(lower - initial_joint):
+    # RealAppliance is authored closed at one of the limits.  World reset may
+    # already advance physics by one step, so snap the episode reset state to
+    # the nearest limit before deciding the opening polarity.
+    if abs(measured_initial_joint - lower) <= abs(measured_initial_joint - upper):
+        initial_joint = lower
         goal_joint = initial_joint + float(ARGS.target_fraction) * (
             upper - initial_joint
         )
         opening_sign = 1.0
     else:
+        initial_joint = upper
         goal_joint = initial_joint + float(ARGS.target_fraction) * (
             lower - initial_joint
         )
         opening_sign = -1.0
     joint_range = upper - lower
 
+    def reset_appliance_to_closed() -> None:
+        positions = np.asarray(appliance.get_joint_positions(), dtype=np.float32).reshape(-1)
+        velocities = np.zeros_like(positions)
+        positions[target_index] = initial_joint
+        appliance.set_joint_positions(positions)
+        appliance.set_joint_velocities(velocities)
+
+    friction_candidates = sorted(
+        set(float(value) for value in ARGS.joint_friction_candidates.split(","))
+    )
+    if not friction_candidates or friction_candidates[0] < 0:
+        raise ValueError("joint-friction candidates must be non-negative")
+    friction_calibration: list[dict[str, float]] = []
+    selected_joint_friction: float | None = None
+    for coefficient in friction_candidates:
+        appliance.set_friction_coefficients(
+            np.asarray([[coefficient]], dtype=np.float32),
+            joint_indices=np.asarray([target_index], dtype=np.int64),
+        )
+        reset_appliance_to_closed()
+        for _ in range(int(ARGS.passive_baseline_steps)):
+            world.step(render=False)
+        position = float(
+            np.asarray(appliance.get_joint_positions(), dtype=np.float64).reshape(-1)[
+                target_index
+            ]
+        )
+        drift = max(0.0, min(1.0, opening_sign * (position - initial_joint) / joint_range))
+        friction_calibration.append(
+            {"coefficient": coefficient, "passive_drift_fraction": drift}
+        )
+        if drift <= float(ARGS.max_passive_drift_fraction):
+            selected_joint_friction = coefficient
+            break
+    if selected_joint_friction is None:
+        selected_joint_friction = friction_candidates[-1]
+    appliance.set_friction_coefficients(
+        np.asarray([[selected_joint_friction]], dtype=np.float32),
+        joint_indices=np.asarray([target_index], dtype=np.int64),
+    )
+    reset_appliance_to_closed()
+
     friction = apply_contact_material(
-        world.stage, target_body_path, ARGS.friction_multiplier
+        world.stage, component_body_paths, ARGS.friction_multiplier
     )
     controller = RMPFlowController("native_open_rmpflow", robot_articulation=franka)
     robot_controller = franka.get_articulation_controller()
@@ -575,6 +638,7 @@ def main() -> None:
         "asset_usd": str(ARGS.asset_usd.resolve()),
         "asset_specific_parameters": False,
         "target_dof_name": ARGS.target_dof_name,
+        "moving_component_body_paths": component_body_paths,
         "joint_type": ARGS.joint_type,
         "joint_limits": [lower, upper],
         "initial_joint_position": initial_joint,
@@ -595,10 +659,13 @@ def main() -> None:
         "max_passive_drift_fraction": float(ARGS.max_passive_drift_fraction),
         "passive_baseline_failed": passive_baseline_failed,
         "object_joint_commands_issued": 0,
+        "object_reset_writes": len(friction_calibration) + 1,
         "attachment_used": False,
         "penetration_audit_complete": False,
         "dataset_ready": False,
         "friction": friction,
+        "joint_friction_calibration": friction_calibration,
+        "selected_joint_friction": selected_joint_friction,
         "trace_steps": len(trace),
     }
     if result["functional_open_success"] and open_contact_steps > 0:
