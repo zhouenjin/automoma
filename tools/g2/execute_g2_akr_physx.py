@@ -45,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-lead-ramp-seconds", type=float, default=1.0)
     parser.add_argument("--progress-epsilon-fraction", type=float, default=0.0005)
     parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.008)
+    parser.add_argument("--maximum-contact-base-tracking-error-m", type=float, default=0.015)
     parser.add_argument("--maximum-base-yaw-error-rad", type=float, default=0.02)
     parser.add_argument("--maximum-robot-joint-tracking-error-rad", type=float, default=0.04)
     return parser.parse_args()
@@ -65,6 +66,8 @@ if ARGS.progress_epsilon_fraction <= 0.0:
     raise ValueError("--progress-epsilon-fraction must be positive")
 if not math.isfinite(ARGS.planner_effort_multiplier) or ARGS.planner_effort_multiplier <= 0.0:
     raise ValueError("--planner-effort-multiplier must be finite and positive")
+if ARGS.maximum_contact_base_tracking_error_m < ARGS.maximum_base_tracking_error_m:
+    raise ValueError("contact-loaded base tolerance must not be smaller than the free-space tolerance")
 APP = SimulationApp({"headless": True, "width": 640, "height": 480, "renderer": "RayTracedLighting"})
 
 from isaacsim.core.api import World  # noqa: E402
@@ -728,8 +731,13 @@ def main() -> int:
         worst_robot_joint_index = int(np.argmax(robot_joint_errors))
         robot_joint_error = float(robot_joint_errors[worst_robot_joint_index])
         worst_robot_joint_name = planner_names[worst_robot_joint_index]
+        active_base_error_limit_m = (
+            ARGS.maximum_contact_base_tracking_error_m
+            if selected_contact_now
+            else ARGS.maximum_base_tracking_error_m
+        )
         tracking_ready = bool(
-            base_error <= ARGS.maximum_base_tracking_error_m
+            base_error <= active_base_error_limit_m
             and yaw_error <= ARGS.maximum_base_yaw_error_rad
             and robot_joint_error <= ARGS.maximum_robot_joint_tracking_error_rad
         )
@@ -750,7 +758,7 @@ def main() -> int:
         )
         probe_enabled = bool(selected_contact_now and probe_fraction > 0.0)
         last_blocking_gates = []
-        if base_error > ARGS.maximum_base_tracking_error_m:
+        if base_error > active_base_error_limit_m:
             last_blocking_gates.append("base_tracking_error")
         if yaw_error > ARGS.maximum_base_yaw_error_rad:
             last_blocking_gates.append("base_yaw_tracking_error")
@@ -766,6 +774,10 @@ def main() -> int:
                 "expected_object_progress": round(expected_progress, 4),
                 "interaction_lead_m": round(interaction_lead_m, 5),
                 "base_error_m": round(base_error, 5),
+                "active_base_error_limit_m": round(active_base_error_limit_m, 5),
+                "base_target_xy_yaw": [round(float(value), 5) for value in base_target],
+                "base_measured_xy_yaw": [round(float(value), 5) for value in measured_base],
+                "base_command_body": [round(float(value), 5) for value in twist],
                 "base_yaw_error_rad": round(yaw_error, 5),
                 "robot_joint_error_rad": round(robot_joint_error, 5),
                 "worst_robot_joint_name": worst_robot_joint_name,
@@ -824,6 +836,12 @@ def main() -> int:
             "maximum_interaction_lead_m": maximum_interaction_lead,
             "interaction_lead_limit_m": ARGS.maximum_interaction_lead_m,
             "probe_interaction_lead_limit_m": ARGS.maximum_probe_interaction_lead_m,
+            "tracking_limits": {
+                "free_space_base_error_m": ARGS.maximum_base_tracking_error_m,
+                "contact_loaded_base_error_m": ARGS.maximum_contact_base_tracking_error_m,
+                "base_yaw_error_rad": ARGS.maximum_base_yaw_error_rad,
+                "robot_joint_error_rad": ARGS.maximum_robot_joint_tracking_error_rad,
+            },
             "friction": friction,
             "planner_effort": {
                 "multiplier": ARGS.planner_effort_multiplier,
