@@ -45,7 +45,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-epsilon-fraction", type=float, default=0.0005)
     parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.008)
     parser.add_argument("--maximum-base-yaw-error-rad", type=float, default=0.02)
-    parser.add_argument("--maximum-robot-joint-tracking-error-rad", type=float, default=0.03)
+    parser.add_argument("--maximum-robot-joint-tracking-error-rad", type=float, default=0.04)
     return parser.parse_args()
 
 
@@ -623,9 +623,13 @@ def main() -> int:
     nominal_steps = max(1, int(math.ceil(duration * ARGS.physics_hz)))
     reference_progress = 0.0
     stalled_steps = 0
-    best_opening_progress = 0.0
+    opening_start_joint = float(_as_numpy(appliance.get_joint_positions()).reshape(-1)[target_index])
+    opening_start_progress = _progress(task, opening_start_joint)
+    maximum_opening_progress = opening_start_progress
+    best_opening_progress = opening_start_progress
     no_object_progress_steps = 0
     latest_audit: dict[str, Any] = {}
+    last_blocking_gates: list[str] = []
     opening_termination = "time_budget_exhausted"
     for _ in range(nominal_steps + ARGS.physics_hz * 8):
         reference = _sample_trajectory(trajectory, reference_progress)
@@ -646,6 +650,7 @@ def main() -> int:
         robot.set_joint_position_targets(reference[3:-1].reshape(1, -1), joint_indices=planner_indices)
         robot.set_joint_position_targets(gripper_targets(1.0).reshape(1, -1), joint_indices=gripper_indices)
         measured_progress, latest_audit = step_and_record()
+        maximum_opening_progress = max(maximum_opening_progress, measured_progress)
         target_audit = latest_audit["spatial_target"]
         if max(
             _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"]),
@@ -656,7 +661,7 @@ def main() -> int:
             _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_a"]),
             _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
         ) >= 0.05
-        if maximum_progress >= float(task["acceptance_fraction"]):
+        if maximum_opening_progress >= float(task["acceptance_fraction"]):
             opening_termination = "acceptance_reached"
             break
         akr_start = trajectory[0, -1]
@@ -678,10 +683,20 @@ def main() -> int:
             measured_joint_position=measured_joint_position,
         )
         maximum_interaction_lead = max(maximum_interaction_lead, interaction_lead_m)
+        measured_robot_joints = _as_numpy(robot.get_joint_positions(joint_indices=planner_indices)).reshape(-1)
+        robot_joint_errors = np.abs(measured_robot_joints - reference[3:-1])
+        worst_robot_joint_index = int(np.argmax(robot_joint_errors))
+        robot_joint_error = float(robot_joint_errors[worst_robot_joint_index])
+        worst_robot_joint_name = planner_names[worst_robot_joint_index]
+        tracking_ready = bool(
+            base_error <= ARGS.maximum_base_tracking_error_m
+            and yaw_error <= ARGS.maximum_base_yaw_error_rad
+            and robot_joint_error <= ARGS.maximum_robot_joint_tracking_error_rad
+        )
         if measured_progress >= best_opening_progress + ARGS.progress_epsilon_fraction:
             best_opening_progress = measured_progress
             no_object_progress_steps = 0
-        elif selected_contact_now:
+        elif selected_contact_now and tracking_ready:
             no_object_progress_steps += 1
         else:
             no_object_progress_steps = 0
@@ -694,8 +709,17 @@ def main() -> int:
             ramp_seconds=ARGS.probe_lead_ramp_seconds,
         )
         probe_enabled = bool(selected_contact_now and probe_fraction > 0.0)
-        measured_robot_joints = _as_numpy(robot.get_joint_positions(joint_indices=planner_indices)).reshape(-1)
-        robot_joint_error = float(np.max(np.abs(measured_robot_joints - reference[3:-1])))
+        last_blocking_gates = []
+        if base_error > ARGS.maximum_base_tracking_error_m:
+            last_blocking_gates.append("base_tracking_error")
+        if yaw_error > ARGS.maximum_base_yaw_error_rad:
+            last_blocking_gates.append("base_yaw_tracking_error")
+        if robot_joint_error > ARGS.maximum_robot_joint_tracking_error_rad:
+            last_blocking_gates.append("robot_joint_tracking_error")
+        if interaction_lead_m > active_lead_limit_m:
+            last_blocking_gates.append("interaction_lead")
+        if not selected_contact_now:
+            last_blocking_gates.append("selected_surface_contact_missing")
         control_telemetry.update(
             {
                 "reference_progress": round(reference_progress, 4),
@@ -704,6 +728,9 @@ def main() -> int:
                 "base_error_m": round(base_error, 5),
                 "base_yaw_error_rad": round(yaw_error, 5),
                 "robot_joint_error_rad": round(robot_joint_error, 5),
+                "worst_robot_joint_name": worst_robot_joint_name,
+                "tracking_ready": tracking_ready,
+                "blocking_gates": last_blocking_gates,
                 "probe_enabled": probe_enabled,
                 "probe_fraction": round(probe_fraction, 4),
                 "active_lead_limit_m": round(active_lead_limit_m, 5),
@@ -711,9 +738,7 @@ def main() -> int:
             }
         )
         can_advance = (
-            base_error <= ARGS.maximum_base_tracking_error_m
-            and yaw_error <= ARGS.maximum_base_yaw_error_rad
-            and robot_joint_error <= ARGS.maximum_robot_joint_tracking_error_rad
+            tracking_ready
             and interaction_lead_m <= active_lead_limit_m
             and selected_contact_now
         )
@@ -729,11 +754,12 @@ def main() -> int:
     robot.set_joint_velocity_targets(np.zeros((1, 4), dtype=np.float32), joint_indices=wheel_indices)
     phase = "final_hold"
     for _ in range(60):
-        step_and_record()
+        hold_progress, _ = step_and_record()
+        maximum_opening_progress = max(maximum_opening_progress, hold_progress)
     videos = recorder.encode()
     penetration = max(0.0, -minimum_separation)
     failure_reasons = physical_open_failure_reasons(
-        maximum_progress_fraction=maximum_progress,
+        maximum_progress_fraction=maximum_opening_progress,
         acceptance_fraction=float(task["acceptance_fraction"]),
         contact_during_opening=contact_during_opening,
         maximum_penetration_m=penetration,
@@ -745,7 +771,9 @@ def main() -> int:
     result.update(
         {
             "strict_physical_open_success": strict_success,
-            "maximum_progress_fraction": maximum_progress,
+            "maximum_progress_fraction": maximum_opening_progress,
+            "maximum_episode_progress_fraction": maximum_progress,
+            "opening_start_progress_fraction": opening_start_progress,
             "acceptance_fraction": float(task["acceptance_fraction"]),
             "measured_finger_contact": measured_finger_contact,
             "contact_during_opening": contact_during_opening,
@@ -763,6 +791,7 @@ def main() -> int:
             "recorded_frame_count": recorder.frame_count,
             "skipped_empty_camera_frames": recorder.skipped_empty_frames,
             "opening_termination": opening_termination,
+            "blocking_gates_at_termination": last_blocking_gates,
             "failure_reasons": list(failure_reasons),
             "failure_reason": None if strict_success else "+".join(failure_reasons),
         }
