@@ -123,19 +123,56 @@ door by roughly 4--5 cm. A metric-gated run limited this lead to 3 mm and kept
 bilateral contact, but stalled at 1.147% because 3 mm preload did not overcome
 static friction and the 5 mm base tracking gate was marginally too tight.
 
-The current controller therefore uses a contact-conditioned, metric probe:
+The controller therefore uses a contact-conditioned, metric probe:
 
 - ordinary planned-contact lead is at most 3 mm;
 - after 0.5 s with selected contact and no measurable articulation progress,
   the limit ramps continuously over 1.0 s to at most 15 mm;
 - any target progress or contact loss immediately resets the probe;
-- base tracking tolerance is 8 mm, while yaw and manipulator tracking remain
-  independently gated.
+- free-space base tracking tolerance is 8 mm and selected-contact-loaded
+  tolerance is 15 mm, while yaw and manipulator tracking remain independently
+  gated.
 
-This probe is a global static-friction mechanism, not an asset rule. Its first
-055 physics validation is pending. Results before the complete home-to-contact
-and release/retreat phases remain `dataset_ready=false` even if they pass the
-physical opening threshold.
+This probe is a global static-friction mechanism, not an asset rule. Subsequent
+055 ablations isolated three separate effects:
+
+- the original progress statistic included a close-phase transient; after
+  separating opening-only progress, the nominal controller advanced only
+  0.028%;
+- scaling every authored planner drive effort by 1.5 reduced the saturated
+  body-joint tracking error from 0.057 rad to 0.0055 rad and produced 1.519%
+  physical opening;
+- allowing bounded 15 mm base compliance under selected contact produced
+  8.292% opening with 0.345 mm peak penetration, after which the single-finger
+  contact slipped and the passive door closed again;
+- doubling the base position gain from 1.5 to 3.0 made the result worse:
+  opening fell to 6.639%, off-selected contact rose to 49.47 N, and penetration
+  rose to 1.989 mm. The default gain was therefore reverted rather than being
+  retained as an unexplained tuning knob.
+
+These are failure cases, not successes. They show that further force/gain
+tuning of one trajectory is no longer the correct search direction.
+
+## Automatic physical hypothesis search
+
+`tools/g2/search_g2_akr_physx.py` removes the remaining manual choice of grasp
+rank, hand, and AKR path. It expands every successful planning attempt into
+physical trials and executes them under a bounded budget. Search is breadth
+first over hypotheses: the best path of every learned contact/hand hypothesis
+is tested before any hypothesis consumes budget on its second-best path. The
+exact launch command, hypothesis metadata, result path, progress, and failure
+reasons are persisted before and after every Isaac invocation. A process guard
+stops the search if the separate G2 pipeline occupies Isaac; it never kills or
+preempts that work.
+
+For the first 055 pool, the top five learned contacts combined with both hands
+gave 10/10 collision-valid planning hypotheses and 52 physical path trials.
+This pool is intentionally broader than the earlier single right-hand,
+rank-zero, 20%-depth diagnostic. Physical execution waits for the shared GPU
+to become idle and will use a six-attempt budget across distinct hypotheses.
+
+Results before the complete home-to-contact and release/retreat phases remain
+`dataset_ready=false` even if they pass the physical opening threshold.
 
 ## Gates
 
