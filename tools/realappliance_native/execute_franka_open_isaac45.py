@@ -191,6 +191,10 @@ def rgba_rgb(camera: Camera) -> np.ndarray:
     if rgba is None:
         raise RuntimeError(f"camera returned no image: {camera.prim_path}")
     image = np.asarray(rgba)
+    if image.size == 0 or image.ndim != 3 or image.shape[-1] < 3:
+        raise RuntimeError(
+            f"camera returned an uninitialized image {image.shape}: {camera.prim_path}"
+        )
     if image.dtype != np.uint8:
         scale = 255.0 if float(np.max(image, initial=0.0)) <= 1.0 else 1.0
         image = np.clip(image * scale, 0, 255).astype(np.uint8)
@@ -394,13 +398,17 @@ def main() -> None:
             }
         )
         if render:
-            frames.append(
-                compose_frame(
-                    {name: rgba_rgb(camera) for name, camera in cameras.items()},
-                    phase,
-                    progress,
+            try:
+                frames.append(
+                    compose_frame(
+                        {name: rgba_rgb(camera) for name, camera in cameras.items()},
+                        phase,
+                        progress,
+                    )
                 )
-            )
+            except RuntimeError:
+                # RTX cameras may need several rendered frames after initialize().
+                pass
         step_count += 1
 
     def step_pose(
