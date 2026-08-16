@@ -1,0 +1,28 @@
+experiment:
+  name: automoma_realappliance_native
+  task: open
+  robot: summit_franka_compatible
+  asset_specific_parameters: false
+
+execution:
+  mode: drive
+  allow_object_joint_commands: false
+  allow_attachment: false
+  allow_asset_id_branches: false
+  scene_collision: false
+  contact_friction_multiplier: 5.0
+
+open:
+  revolute:
+    planning_target_fraction: 0.80
+    dataset_acceptance_fraction: 0.70
+  prismatic:
+    planning_target_fraction: 0.90
+    dataset_acceptance_fraction: 0.80
+
+audit:
+  require_robot_target_contact: true
+  maximum_allowed_penetration_m: 0.002
+  save_multiview_video: true
+  save_failure_video: true
+  camera_distance_multiplier: 2.0
