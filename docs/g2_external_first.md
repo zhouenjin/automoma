@@ -168,8 +168,33 @@ G2 pipeline occupies Isaac; it never kills or preempts that work.
 For the first 055 pool, the top five learned contacts combined with both hands
 gave 10/10 collision-valid planning hypotheses and 52 physical path trials.
 This pool is intentionally broader than the earlier single right-hand,
-rank-zero, 20%-depth diagnostic. Physical execution waits for the shared GPU
-to become idle and will use a six-attempt budget across distinct hypotheses.
+rank-zero, 20%-depth diagnostic. The first physical breadth round tested the
+best AKR path for ranks zero through two on both hands:
+
+| rank | hand | maximum opening | selected contact during opening | key observation |
+|---:|:---:|---:|:---:|:---|
+| 0 | left | 0.326% | no | high off-selected contact |
+| 0 | right | 5.935% | yes | contact later lost |
+| 1 | left | 18.673% | yes | clean contact; only interaction-lead gate remained |
+| 1 | right | 1.743% | no | no target contact acquired |
+| 2 | left | 7.096% | yes | interaction lead reached the probe limit |
+| 2 | right | 1.743% | no | no target contact acquired |
+
+None is a strict physical success. The rank-one left trial is nevertheless a
+useful controller diagnostic: it had zero off-selected force, 1.083 mm peak
+penetration, and 32.997 N peak force. Replaying the automatically selected best
+physical trial with a 4 mm ordinary lead limit produced 18.285%, slightly worse
+than the 3 mm run, so the relaxed limit was rejected. The replay recorded 1,854
+selected-contact steps, including 1,197 bilateral-contact steps, and showed
+that the remaining stop was a time-budget/interaction-lead issue rather than
+contact loss.
+
+The executor now treats `maximum-opening-seconds` as the actual total opening
+budget instead of silently ending a short nominal trajectory after only eight
+extra seconds. It also terminates a candidate after a one-second initial
+contact window when the reference cannot advance without contact; waiting the
+old eight-second stall budget could not create contact because AKR progression
+is contact-gated.
 
 Results before the complete home-to-contact and release/retreat phases remain
 `dataset_ready=false` even if they pass the physical opening threshold.
