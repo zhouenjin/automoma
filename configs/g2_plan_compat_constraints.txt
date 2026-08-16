@@ -1,0 +1,4 @@
+# Compatibility pins for the isolated Isaac Sim 4.5 / CUDA 11.8 planning environment.
+# Torch 2.5.1+cu118 is installed separately from the official PyTorch CUDA index.
+numpy==1.26.4
+warp-lang==1.7.2

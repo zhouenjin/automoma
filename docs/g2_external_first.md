@@ -63,6 +63,28 @@ Pinned upstream commit: `ec423552bf3ac86ca240062fc0a80bdbbbbd4a63`.
 
 Therefore the first executable gate is AutoMoMa planning on a separate CUDA 11.8-compatible environment and robot-only physics execution through the existing Isaac Sim 4.5 runtime. A clean 5.1 reproduction remains blocked until the driver is upgraded; it must not be silently claimed as complete.
 
+The compatibility environment on the 4090 is
+`/home/zhiyuan/external_first/envs/automoma_plan310`. It uses Python 3.10,
+Torch 2.5.1+cu118, NumPy 1.26.4, and Warp 1.7.2. The Warp pin matters: the
+newer 1.16 wheel removed the API expected by AutoMoMa's pinned cuRobo commit.
+Top-level compatibility pins live in `configs/g2_plan_compat_constraints.txt`.
+
+## Automatic task extraction
+
+`extract_usd_tasks()` resolves all task-compatible parts from each asset's
+`gt_part.json`, then follows the USD `physics:body0`/`physics:body1`
+relationships to the authored revolute or prismatic joint. It normalizes
+revolute degrees to radians and verifies that the two authored local joint
+frames agree in world coordinates. The resulting contract contains the target
+link, object-root link, limits, reset state, world pivot, world axis, and the
+initial transforms required by AKR. No asset ID is inspected.
+
+For a candidate EE grasp pose, the adapter computes
+`EE -> target link -> initial joint frame -> object root`. The inserted target
+joint has the opposite displacement. A unit test checks the actual transform
+invariant over several door angles; merely loading the generated URDF is not
+treated as sufficient evidence.
+
 ## Gates
 
 1. Build and validate left/right G2 planner configs with three virtual base DOFs.

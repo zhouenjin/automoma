@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 
+import numpy as np
 import pytest
 
 from automoma.integrations.realappliance.akr_adapter import (
@@ -19,6 +20,12 @@ from automoma.integrations.realappliance.g2_adapter import (
     make_g2_curobo_config,
 )
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
+from automoma.integrations.realappliance.transform_math import (
+    matrix_to_transform_rpy,
+    quaternion_transform,
+    transform_rpy_to_matrix,
+)
+from automoma.integrations.realappliance.usd_task import ExtractedUsdTask, resolve_annotated_parts
 
 
 MINIMAL_G2 = """<?xml version="1.0"?>
@@ -155,6 +162,73 @@ def test_hypothesis_pool_contains_both_hands_without_asset_rules():
     assert {hypothesis.hand for hypothesis in hypotheses} == {Hand.LEFT, Hand.RIGHT}
     assert {hypothesis.grasp_index for hypothesis in hypotheses} == {2, 7}
     assert len(hypotheses) == 2 * 27 * 2
+
+
+def test_open_semantics_resolve_all_door_like_parts_without_asset_ids():
+    annotations = {
+        "start button": "part_01",
+        "left glass door": "part_02",
+        "drawer": "part_03",
+        "right glass door": "part_04",
+    }
+    assert resolve_annotated_parts(annotations, "open") == (
+        ("left glass door", "part_02"),
+        ("drawer", "part_03"),
+        ("right glass door", "part_04"),
+    )
+
+
+def test_rpy_round_trip_preserves_rigid_transform():
+    source = quaternion_transform((0.2, -0.4, 0.7), (0.91, 0.1, -0.25, 0.3))
+    encoded = matrix_to_transform_rpy(source)
+    assert np.allclose(transform_rpy_to_matrix(encoded), source, atol=1e-8)
+
+
+def test_extracted_task_builds_an_akr_chain_that_cancels_target_motion():
+    world_from_joint = quaternion_transform((0.4, -0.2, 0.8), (0.9238795, 0.0, 0.0, 0.3826834))
+    joint_from_handle = quaternion_transform((0.0, 0.35, 0.0), (1.0, 0.0, 0.0, 0.0))
+    world_from_handle = world_from_joint @ joint_from_handle
+    handle_from_ee = quaternion_transform((0.0, 0.0, -0.1), (1.0, 0.0, 0.0, 0.0))
+    world_from_ee = world_from_handle @ handle_from_ee
+    world_from_root = quaternion_transform((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
+    task = ArticulationTaskSpec(
+        joint_name="/World/door/joint",
+        target_link="/World/door",
+        handle_link="/World/door",
+        joint_kind=JointKind.REVOLUTE,
+        axis=(0.0, 0.0, 1.0),
+        pivot=(0.4, -0.2, 0.8),
+        lower_limit=0.0,
+        upper_limit=1.5,
+        initial_position=0.0,
+    )
+    extracted = ExtractedUsdTask(
+        task_name="open",
+        semantic_label="door",
+        annotated_part="part_00",
+        joint_path=task.joint_name,
+        body0_path="/World/body",
+        body1_path=task.target_link,
+        task=task,
+        joint_axis_local=(0.0, 0.0, 1.0),
+        world_from_joint_at_initial=tuple(tuple(v for v in row) for row in world_from_joint),
+        world_from_target_link_at_initial=tuple(tuple(v for v in row) for row in world_from_handle),
+        world_from_object_root=tuple(tuple(v for v in row) for row in world_from_root),
+    )
+    attachment = extracted.make_attachment_spec(Hand.LEFT, world_from_ee)
+    ee_to_handle = transform_rpy_to_matrix(attachment.ee_to_handle)
+    handle_to_joint = transform_rpy_to_matrix(attachment.handle_to_joint_at_initial)
+    joint_to_root = transform_rpy_to_matrix(attachment.joint_at_initial_to_object_root)
+
+    for delta in (0.0, 0.4, 1.2):
+        joint_motion = quaternion_transform((0.0, 0.0, 0.0), (np.cos(delta / 2), 0.0, 0.0, np.sin(delta / 2)))
+        moved_handle = world_from_joint @ joint_motion @ joint_from_handle
+        moved_ee = moved_handle @ handle_from_ee
+        inverse_joint_motion = quaternion_transform(
+            (0.0, 0.0, 0.0), (np.cos(delta / 2), 0.0, 0.0, -np.sin(delta / 2))
+        )
+        terminal = moved_ee @ ee_to_handle @ handle_to_joint @ inverse_joint_motion @ joint_to_root
+        assert np.allclose(terminal, world_from_root, atol=1e-8)
 
 
 def test_physics_policy_rejects_object_joint_writes():
