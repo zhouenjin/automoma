@@ -48,6 +48,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-lead-ramp-seconds", type=float, default=1.0)
     parser.add_argument("--progress-epsilon-fraction", type=float, default=0.0005)
     parser.add_argument("--initial-contact-acquisition-seconds", type=float, default=1.0)
+    parser.add_argument("--maximum-regrasp-attempts", type=int, default=2)
+    parser.add_argument("--contact-loss-seconds", type=float, default=0.10)
+    parser.add_argument("--regrasp-open-fraction", type=float, default=0.30)
+    parser.add_argument("--regrasp-open-seconds", type=float, default=0.30)
+    parser.add_argument("--regrasp-reposition-seconds", type=float, default=2.0)
+    parser.add_argument("--regrasp-close-seconds", type=float, default=1.5)
+    parser.add_argument("--regrasp-stable-contact-seconds", type=float, default=0.10)
     parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.008)
     parser.add_argument("--maximum-contact-base-tracking-error-m", type=float, default=0.015)
     parser.add_argument("--maximum-base-yaw-error-rad", type=float, default=0.02)
@@ -72,6 +79,14 @@ if ARGS.progress_epsilon_fraction <= 0.0:
     raise ValueError("--progress-epsilon-fraction must be positive")
 if ARGS.initial_contact_acquisition_seconds <= 0.0:
     raise ValueError("--initial-contact-acquisition-seconds must be positive")
+if ARGS.maximum_regrasp_attempts < 0:
+    raise ValueError("--maximum-regrasp-attempts must be non-negative")
+if ARGS.contact_loss_seconds <= 0.0 or ARGS.regrasp_stable_contact_seconds <= 0.0:
+    raise ValueError("contact loss and stable regrasp durations must be positive")
+if not 0.0 <= ARGS.regrasp_open_fraction < 1.0:
+    raise ValueError("--regrasp-open-fraction must be in [0, 1)")
+if min(ARGS.regrasp_open_seconds, ARGS.regrasp_reposition_seconds, ARGS.regrasp_close_seconds) <= 0.0:
+    raise ValueError("regrasp phase durations must be positive")
 if not math.isfinite(ARGS.planner_effort_multiplier) or ARGS.planner_effort_multiplier <= 0.0:
     raise ValueError("--planner-effort-multiplier must be finite and positive")
 if not math.isfinite(ARGS.base_effort_multiplier) or ARGS.base_effort_multiplier <= 0.0:
@@ -108,6 +123,7 @@ from automoma.integrations.realappliance.g2_runtime import (  # noqa: E402
     STEERING_JOINT_NAMES,
     WHEEL_JOINT_NAMES,
     actuator_groups,
+    akr_parameter_for_articulation_progress,
     adaptive_interaction_lead_limit_m,
     gripper_targets,
     named_indices,
@@ -701,7 +717,29 @@ def main() -> int:
     latest_audit: dict[str, Any] = {}
     last_blocking_gates: list[str] = []
     opening_termination = "time_budget_exhausted"
+    regrasp_phase: str | None = None
+    regrasp_phase_step = 0
+    regrasp_attempts = 0
+    regrasp_recoveries = 0
+    selected_contact_seen = False
+    selected_contact_missing_steps = 0
+    regrasp_stable_contact_steps = 0
+    regrasp_trigger_progress_fractions: list[float] = []
+    regrasp_recovery_progress_fractions: list[float] = []
+    contact_loss_steps = max(1, int(math.ceil(ARGS.contact_loss_seconds * ARGS.physics_hz)))
+    regrasp_open_steps = max(1, int(math.ceil(ARGS.regrasp_open_seconds * ARGS.physics_hz)))
+    regrasp_reposition_steps = max(1, int(math.ceil(ARGS.regrasp_reposition_seconds * ARGS.physics_hz)))
+    regrasp_close_steps = max(1, int(math.ceil(ARGS.regrasp_close_seconds * ARGS.physics_hz)))
+    stable_regrasp_steps = max(1, int(math.ceil(ARGS.regrasp_stable_contact_seconds * ARGS.physics_hz)))
     for opening_step in range(maximum_total_opening_steps):
+        if regrasp_phase is not None:
+            live_joint_position = float(_as_numpy(appliance.get_joint_positions()).reshape(-1)[target_index])
+            live_progress = _progress(task, live_joint_position)
+            reference_progress = akr_parameter_for_articulation_progress(
+                trajectory[:, -1],
+                planning_fraction=float(task["planning_fraction"]),
+                measured_progress_fraction=live_progress,
+            )
         reference = _sample_trajectory(trajectory, reference_progress)
         position_raw, quaternion_raw = base_probe.get_world_pose()
         measured_base = np.asarray(
@@ -723,7 +761,23 @@ def main() -> int:
         robot.set_joint_position_targets(steering.reshape(1, -1), joint_indices=steering_indices)
         robot.set_joint_velocity_targets(wheel.reshape(1, -1), joint_indices=wheel_indices)
         robot.set_joint_position_targets(reference[3:-1].reshape(1, -1), joint_indices=planner_indices)
-        robot.set_joint_position_targets(gripper_targets(1.0).reshape(1, -1), joint_indices=gripper_indices)
+        gripper_fraction = 1.0
+        if regrasp_phase == "open":
+            local_fraction = min(1.0, (regrasp_phase_step + 1) / regrasp_open_steps)
+            gripper_fraction = 1.0 + local_fraction * (ARGS.regrasp_open_fraction - 1.0)
+            phase = "regrasp_open"
+        elif regrasp_phase == "reposition":
+            gripper_fraction = ARGS.regrasp_open_fraction
+            phase = "regrasp_reposition"
+        elif regrasp_phase == "close":
+            local_fraction = min(1.0, (regrasp_phase_step + 1) / regrasp_close_steps)
+            gripper_fraction = ARGS.regrasp_open_fraction + local_fraction * (1.0 - ARGS.regrasp_open_fraction)
+            phase = "regrasp_close"
+        else:
+            phase = "opening"
+        robot.set_joint_position_targets(
+            gripper_targets(gripper_fraction).reshape(1, -1), joint_indices=gripper_indices
+        )
         measured_progress, latest_audit = step_and_record()
         maximum_opening_progress = max(maximum_opening_progress, measured_progress)
         target_audit = latest_audit["spatial_target"]
@@ -734,6 +788,12 @@ def main() -> int:
         if max(finger_a_force, finger_b_force) >= 0.05:
             contact_during_opening = True
         selected_contact_now = max(finger_a_force, finger_b_force) >= 0.05
+        if regrasp_phase is None:
+            if selected_contact_now:
+                selected_contact_seen = True
+                selected_contact_missing_steps = 0
+            elif selected_contact_seen:
+                selected_contact_missing_steps += 1
         opening_selected_contact_steps += int(selected_contact_now)
         opening_bilateral_contact_steps += int(min(finger_a_force, finger_b_force) >= 0.05)
         if maximum_opening_progress >= float(task["acceptance_fraction"]):
@@ -822,8 +882,65 @@ def main() -> int:
                 "probe_fraction": round(probe_fraction, 4),
                 "active_lead_limit_m": round(active_lead_limit_m, 5),
                 "no_object_progress_steps": no_object_progress_steps,
+                "gripper_command_fraction": round(gripper_fraction, 4),
+                "regrasp_phase": regrasp_phase,
+                "regrasp_attempt": regrasp_attempts,
+                "regrasp_recoveries": regrasp_recoveries,
+                "selected_contact_missing_steps": selected_contact_missing_steps,
             }
         )
+        if regrasp_phase is not None:
+            regrasp_phase_step += 1
+            if regrasp_phase == "open" and regrasp_phase_step >= regrasp_open_steps:
+                regrasp_phase = "reposition"
+                regrasp_phase_step = 0
+                regrasp_stable_contact_steps = 0
+            elif regrasp_phase == "reposition" and regrasp_phase_step >= regrasp_reposition_steps:
+                regrasp_phase = "close"
+                regrasp_phase_step = 0
+                regrasp_stable_contact_steps = 0
+            elif regrasp_phase == "close":
+                if selected_contact_now:
+                    regrasp_stable_contact_steps += 1
+                else:
+                    regrasp_stable_contact_steps = 0
+                if regrasp_stable_contact_steps >= stable_regrasp_steps:
+                    regrasp_recoveries += 1
+                    regrasp_recovery_progress_fractions.append(measured_progress)
+                    regrasp_phase = None
+                    regrasp_phase_step = 0
+                    regrasp_stable_contact_steps = 0
+                    selected_contact_seen = True
+                    selected_contact_missing_steps = 0
+                    stalled_steps = 0
+                    no_object_progress_steps = 0
+                    best_opening_progress = max(best_opening_progress, measured_progress)
+                elif regrasp_phase_step >= regrasp_close_steps:
+                    if regrasp_attempts < ARGS.maximum_regrasp_attempts:
+                        regrasp_attempts += 1
+                        regrasp_trigger_progress_fractions.append(measured_progress)
+                        regrasp_phase = "open"
+                        regrasp_phase_step = 0
+                        regrasp_stable_contact_steps = 0
+                    else:
+                        opening_termination = "regrasp_contact_not_recovered"
+                        last_blocking_gates = ["selected_surface_contact_missing"]
+                        break
+            continue
+
+        if selected_contact_missing_steps >= contact_loss_steps:
+            if regrasp_attempts < ARGS.maximum_regrasp_attempts:
+                regrasp_attempts += 1
+                regrasp_trigger_progress_fractions.append(measured_progress)
+                regrasp_phase = "open"
+                regrasp_phase_step = 0
+                regrasp_stable_contact_steps = 0
+                stalled_steps = 0
+                no_object_progress_steps = 0
+                continue
+            opening_termination = "regrasp_budget_exhausted"
+            last_blocking_gates = ["selected_surface_contact_missing"]
+            break
         can_advance = (
             tracking_ready
             and interaction_lead_m <= active_lead_limit_m
@@ -882,6 +999,19 @@ def main() -> int:
             "maximum_opening_finger_b_force_n": maximum_opening_finger_b_force,
             "opening_selected_contact_steps": opening_selected_contact_steps,
             "opening_bilateral_contact_steps": opening_bilateral_contact_steps,
+            "regrasp": {
+                "maximum_attempts": ARGS.maximum_regrasp_attempts,
+                "attempts": regrasp_attempts,
+                "recoveries": regrasp_recoveries,
+                "contact_loss_seconds": ARGS.contact_loss_seconds,
+                "open_fraction": ARGS.regrasp_open_fraction,
+                "open_seconds": ARGS.regrasp_open_seconds,
+                "reposition_seconds": ARGS.regrasp_reposition_seconds,
+                "close_seconds": ARGS.regrasp_close_seconds,
+                "stable_contact_seconds": ARGS.regrasp_stable_contact_seconds,
+                "trigger_progress_fractions": regrasp_trigger_progress_fractions,
+                "recovery_progress_fractions": regrasp_recovery_progress_fractions,
+            },
             "final_control_telemetry": control_telemetry,
             "interaction_lead_limit_m": ARGS.maximum_interaction_lead_m,
             "probe_interaction_lead_limit_m": ARGS.maximum_probe_interaction_lead_m,
