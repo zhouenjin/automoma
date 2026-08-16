@@ -279,7 +279,11 @@ def main() -> None:
     target_index = target_matches[0]
     limits = np.asarray(appliance.get_dof_limits(), dtype=np.float64).reshape(-1, 2)
     lower, upper = map(float, limits[target_index])
-    initial_joint = float(np.asarray(appliance.get_joint_positions())[target_index])
+    initial_joint = float(
+        np.asarray(appliance.get_joint_positions(), dtype=np.float64).reshape(-1)[
+            target_index
+        ]
+    )
     if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
         raise RuntimeError(f"invalid target joint limits: {(lower, upper)}")
     if abs(upper - initial_joint) >= abs(lower - initial_joint):
@@ -305,7 +309,7 @@ def main() -> None:
     if len(finger_indices) == 2:
         baseline_effort = np.asarray(
             franka.get_max_efforts(joint_indices=finger_indices), dtype=np.float32
-        )
+        ).reshape(-1)
         franka.set_max_efforts(
             baseline_effort * float(ARGS.finger_effort_multiplier),
             joint_indices=finger_indices,
@@ -340,7 +344,11 @@ def main() -> None:
     step_count = 0
 
     def measured_progress() -> tuple[float, float]:
-        position = float(np.asarray(appliance.get_joint_positions())[target_index])
+        position = float(
+            np.asarray(appliance.get_joint_positions(), dtype=np.float64).reshape(-1)[
+                target_index
+            ]
+        )
         fraction = max(
             0.0, min(1.0, opening_sign * (position - initial_joint) / joint_range)
         )
