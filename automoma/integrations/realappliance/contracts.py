@@ -92,3 +92,27 @@ class PhysicsRunPolicy:
             raise ValueError("measured robot-handle contact is required")
         if not self.require_penetration_audit:
             raise ValueError("penetration auditing is required")
+
+
+def physical_open_failure_reasons(
+    *,
+    maximum_progress_fraction: float,
+    acceptance_fraction: float,
+    contact_during_opening: bool,
+    maximum_penetration_m: float,
+    allowed_penetration_m: float,
+    maximum_contact_force_n: float,
+    allowed_contact_force_n: float,
+) -> tuple[str, ...]:
+    """Return all violated physical-opening clauses, not a generic failure."""
+
+    reasons = []
+    if maximum_progress_fraction < acceptance_fraction:
+        reasons.append("insufficient_open_progress")
+    if not contact_during_opening:
+        reasons.append("no_selected_surface_contact_during_opening")
+    if maximum_penetration_m > allowed_penetration_m:
+        reasons.append("excessive_penetration")
+    if maximum_contact_force_n > allowed_contact_force_n:
+        reasons.append("excessive_contact_force")
+    return tuple(reasons)

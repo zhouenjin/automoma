@@ -11,7 +11,12 @@ from automoma.integrations.realappliance.akr_adapter import (
     build_g2_akr_urdf,
     make_g2_akr_config,
 )
-from automoma.integrations.realappliance.contracts import ArticulationTaskSpec, JointKind, PhysicsRunPolicy
+from automoma.integrations.realappliance.contracts import (
+    ArticulationTaskSpec,
+    JointKind,
+    PhysicsRunPolicy,
+    physical_open_failure_reasons,
+)
 from automoma.integrations.realappliance.contact_candidates import ContactCandidate
 from automoma.integrations.realappliance.g2_adapter import (
     Bounds3D,
@@ -293,6 +298,32 @@ def test_physics_policy_rejects_object_joint_writes():
     with pytest.raises(ValueError, match="write_target_joint"):
         PhysicsRunPolicy(write_target_joint=True).validate()
     PhysicsRunPolicy().validate()
+
+
+def test_physical_failure_contract_reports_every_violated_clause():
+    assert physical_open_failure_reasons(
+        maximum_progress_fraction=0.2,
+        acceptance_fraction=0.7,
+        contact_during_opening=False,
+        maximum_penetration_m=0.004,
+        allowed_penetration_m=0.003,
+        maximum_contact_force_n=260.0,
+        allowed_contact_force_n=250.0,
+    ) == (
+        "insufficient_open_progress",
+        "no_selected_surface_contact_during_opening",
+        "excessive_penetration",
+        "excessive_contact_force",
+    )
+    assert not physical_open_failure_reasons(
+        maximum_progress_fraction=0.7,
+        acceptance_fraction=0.7,
+        contact_during_opening=True,
+        maximum_penetration_m=0.003,
+        allowed_penetration_m=0.003,
+        maximum_contact_force_n=250.0,
+        allowed_contact_force_n=250.0,
+    )
 
 
 def test_automatic_trajectory_selection_uses_global_cspace_metric():

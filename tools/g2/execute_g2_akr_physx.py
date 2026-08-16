@@ -79,7 +79,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from automoma.integrations.realappliance.contracts import PhysicsRunPolicy  # noqa: E402
+from automoma.integrations.realappliance.contracts import (  # noqa: E402
+    PhysicsRunPolicy,
+    physical_open_failure_reasons,
+)
 from automoma.integrations.realappliance.g2_adapter import Hand  # noqa: E402
 from automoma.integrations.realappliance.g2_runtime import (  # noqa: E402
     GRIPPER_JOINT_NAMES,
@@ -623,6 +626,7 @@ def main() -> int:
     best_opening_progress = 0.0
     no_object_progress_steps = 0
     latest_audit: dict[str, Any] = {}
+    opening_termination = "time_budget_exhausted"
     for _ in range(nominal_steps + ARGS.physics_hz * 8):
         reference = _sample_trajectory(trajectory, reference_progress)
         position_raw, quaternion_raw = base_probe.get_world_pose()
@@ -653,6 +657,7 @@ def main() -> int:
             _group_force(target_audit, GRIPPER_LINK_GROUPS[hand]["finger_b"]),
         ) >= 0.05
         if maximum_progress >= float(task["acceptance_fraction"]):
+            opening_termination = "acceptance_reached"
             break
         akr_start = trajectory[0, -1]
         akr_goal = trajectory[-1, -1]
@@ -718,6 +723,7 @@ def main() -> int:
         else:
             stalled_steps += 1
         if stalled_steps > ARGS.physics_hz * 8:
+            opening_termination = "control_stalled"
             break
 
     robot.set_joint_velocity_targets(np.zeros((1, 4), dtype=np.float32), joint_indices=wheel_indices)
@@ -726,12 +732,16 @@ def main() -> int:
         step_and_record()
     videos = recorder.encode()
     penetration = max(0.0, -minimum_separation)
-    strict_success = bool(
-        maximum_progress >= float(task["acceptance_fraction"])
-        and contact_during_opening
-        and penetration <= ARGS.maximum_penetration_m
-        and maximum_force <= ARGS.maximum_contact_force_n
+    failure_reasons = physical_open_failure_reasons(
+        maximum_progress_fraction=maximum_progress,
+        acceptance_fraction=float(task["acceptance_fraction"]),
+        contact_during_opening=contact_during_opening,
+        maximum_penetration_m=penetration,
+        allowed_penetration_m=ARGS.maximum_penetration_m,
+        maximum_contact_force_n=maximum_force,
+        allowed_contact_force_n=ARGS.maximum_contact_force_n,
     )
+    strict_success = not failure_reasons
     result.update(
         {
             "strict_physical_open_success": strict_success,
@@ -752,7 +762,9 @@ def main() -> int:
             "step_count": step_count,
             "recorded_frame_count": recorder.frame_count,
             "skipped_empty_camera_frames": recorder.skipped_empty_frames,
-            "failure_reason": None if strict_success else "strict_physical_contract_not_met",
+            "opening_termination": opening_termination,
+            "failure_reasons": list(failure_reasons),
+            "failure_reason": None if strict_success else "+".join(failure_reasons),
         }
     )
     (ARGS.output_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
