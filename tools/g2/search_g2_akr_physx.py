@@ -16,7 +16,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from automoma.integrations.realappliance.physical_search import enumerate_physical_trials  # noqa: E402
+from automoma.integrations.realappliance.physical_search import (  # noqa: E402
+    enumerate_physical_trials,
+    prioritize_best_observed_trial,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -30,6 +33,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-successes", type=int, default=3)
     parser.add_argument("--render-stride", type=int, default=8)
     parser.add_argument("--executor-argument", action="append", default=[])
+    parser.add_argument("--feedback-search-report", type=Path)
     parser.add_argument("--wait-for-idle-seconds", type=float, default=0.0)
     parser.add_argument("--busy-poll-seconds", type=float, default=20.0)
     parser.add_argument(
@@ -78,6 +82,10 @@ def main() -> int:
     args.output_dir.mkdir(parents=True)
     report = json.loads(args.plan_report.read_text(encoding="utf-8"))
     trials = enumerate_physical_trials(report, report_path=args.plan_report)
+    feedback = None
+    if args.feedback_search_report is not None:
+        feedback = json.loads(args.feedback_search_report.read_text(encoding="utf-8"))
+        trials = prioritize_best_observed_trial(trials, feedback)
     search: dict[str, Any] = {
         "schema_version": 1,
         "mode": "automatic_learned_contact_akr_physx_search",
@@ -89,6 +97,9 @@ def main() -> int:
         "dataset_ready_blockers": ["home_to_precontact_transit_pending", "release_and_retreat_pending"],
         "attempts": [],
     }
+    if feedback is not None:
+        search["feedback_search_report"] = str(args.feedback_search_report.resolve())
+        search["feedback_selected_trial"] = trials[0].to_dict()
     search_path = args.output_dir / "search_report.json"
     _write_search_report(search_path, search)
 

@@ -34,7 +34,10 @@ from automoma.integrations.realappliance.g2_runtime import (
     swerve_inverse_kinematics,
 )
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
-from automoma.integrations.realappliance.physical_search import enumerate_physical_trials
+from automoma.integrations.realappliance.physical_search import (
+    enumerate_physical_trials,
+    prioritize_best_observed_trial,
+)
 from automoma.integrations.realappliance.transform_math import (
     axis_motion_transform,
     matrix_to_pose_wxyz,
@@ -396,6 +399,67 @@ def test_akr_rebase_parameter_handles_direction_and_nonuniform_progress():
     assert akr_parameter_for_articulation_progress(
         [0.0, 0.2, 0.8], planning_fraction=0.8, measured_progress_fraction=2.0
     ) == pytest.approx(1.0)
+
+
+def test_physical_feedback_replays_highest_progress_trial_first(tmp_path):
+    report_path = tmp_path / "report.json"
+    trials = enumerate_physical_trials(
+        {
+            "attempts": [
+                {
+                    "attempt_id": "first",
+                    "automatic_rank": 0,
+                    "pre_ik_score": 5.0,
+                    "hand": "left",
+                    "capture_depth_fraction": 0.35,
+                    "success": True,
+                    "planning": {
+                        "automatic_trajectory_selection": {
+                            "ranked_valid_trajectory_indices": [0],
+                            "scores_per_trajectory": [1.0],
+                        }
+                    },
+                },
+                {
+                    "attempt_id": "best",
+                    "automatic_rank": 1,
+                    "pre_ik_score": 4.0,
+                    "hand": "right",
+                    "capture_depth_fraction": 0.35,
+                    "success": True,
+                    "planning": {
+                        "automatic_trajectory_selection": {
+                            "ranked_valid_trajectory_indices": [2],
+                            "scores_per_trajectory": [9.0, 9.0, 2.0],
+                        }
+                    },
+                },
+            ]
+        },
+        report_path=report_path,
+    )
+    prioritized = prioritize_best_observed_trial(
+        trials,
+        {
+            "attempts": [
+                {
+                    "search_index": 0,
+                    "status": "completed",
+                    "maximum_progress_fraction": 0.1,
+                    "strict_physical_open_success": False,
+                    "trial": {"attempt_id": "first", "trajectory_index": 0},
+                },
+                {
+                    "search_index": 1,
+                    "status": "completed",
+                    "maximum_progress_fraction": 0.4,
+                    "strict_physical_open_success": False,
+                    "trial": {"attempt_id": "best", "trajectory_index": 2},
+                },
+            ]
+        },
+    )
+    assert (prioritized[0].attempt_id, prioritized[0].trajectory_index) == ("best", 2)
 
 
 def test_g2_runtime_maps_planar_twist_to_four_swerve_modules():

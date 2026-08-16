@@ -70,3 +70,37 @@ def enumerate_physical_trials(
         )
     )
     return tuple(item[2] for item in trials)
+
+
+def prioritize_best_observed_trial(
+    trials: Sequence[PhysicalExecutionTrial],
+    feedback_report: Mapping[str, Any],
+) -> tuple[PhysicalExecutionTrial, ...]:
+    """Replay the strongest measured trial first for a controller ablation."""
+
+    completed = [
+        attempt
+        for attempt in feedback_report.get("attempts", ())
+        if attempt.get("status") == "completed" and attempt.get("maximum_progress_fraction") is not None
+    ]
+    if not completed:
+        raise ValueError("feedback search report contains no completed physical attempts")
+    best = max(
+        completed,
+        key=lambda attempt: (
+            bool(attempt.get("strict_physical_open_success")),
+            float(attempt["maximum_progress_fraction"]),
+            -int(attempt.get("search_index", 0)),
+        ),
+    )
+    best_trial = best["trial"]
+    matching = [
+        trial
+        for trial in trials
+        if trial.attempt_id == str(best_trial["attempt_id"])
+        and trial.trajectory_index == int(best_trial["trajectory_index"])
+    ]
+    if len(matching) != 1:
+        raise ValueError("best feedback trial is absent or ambiguous in the current planning report")
+    selected = matching[0]
+    return (selected, *(trial for trial in trials if trial != selected))
