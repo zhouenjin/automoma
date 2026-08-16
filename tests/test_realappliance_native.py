@@ -5,6 +5,9 @@ from automoma.integrations.realappliance_native import (
     JointConditionedContactPath,
     OpenEpisodeContract,
     OpenEpisodeSample,
+    RealApplianceUsdManifest,
+    UsdJointDescriptor,
+    choose_open_joint_candidates,
 )
 from automoma.integrations.realappliance_native.contracts import (
     require_robot_only_action,
@@ -70,3 +73,51 @@ def test_robot_only_action_width_is_enforced() -> None:
         assert "robot-only" in str(exc)
     else:
         raise AssertionError("object-appended action must be rejected")
+
+
+def test_usd_inventory_selects_all_openable_joints_without_asset_id_rules() -> None:
+    fixed = UsdJointDescriptor(
+        path="/World/body/fixed",
+        joint_type="fixed",
+        parent_body=None,
+        child_body="/World/body",
+        axis=None,
+        lower_limit=None,
+        upper_limit=None,
+        local_position_parent=(0.0, 0.0, 0.0),
+        local_position_child=(0.0, 0.0, 0.0),
+    )
+    door = UsdJointDescriptor(
+        path="/World/door/hinge",
+        joint_type="revolute",
+        parent_body="/World/body",
+        child_body="/World/door",
+        axis="X",
+        lower_limit=0.0,
+        upper_limit=90.0,
+        local_position_parent=(0.0, 0.0, 0.0),
+        local_position_child=(0.0, 0.0, 0.0),
+    )
+    button = UsdJointDescriptor(
+        path="/World/button/slide",
+        joint_type="prismatic",
+        parent_body="/World/body",
+        child_body="/World/button",
+        axis="Z",
+        lower_limit=0.0,
+        upper_limit=0.0,
+        local_position_parent=(0.0, 0.0, 0.0),
+        local_position_child=(0.0, 0.0, 0.0),
+    )
+
+    candidates = choose_open_joint_candidates((fixed, button, door))
+
+    assert candidates == (door,)
+    manifest = RealApplianceUsdManifest(
+        asset_id="unseen",
+        source_usd="/tmp/Aligned.usd",
+        joints=(fixed, button, door),
+        mesh_paths=("/World/door",),
+        rigid_body_paths=("/World/body", "/World/door"),
+    )
+    assert manifest.to_dict()["provenance"]["g2_inputs_used"] is False

@@ -2,6 +2,12 @@
 
 from .contracts import OpenEpisodeAudit, OpenEpisodeContract, OpenEpisodeSample
 from .kinematics import ArticulationSpec, JointConditionedContactPath
+from .usd_articulation import (
+    RealApplianceUsdManifest,
+    UsdJointDescriptor,
+    choose_open_joint_candidates,
+    descriptor_from_mapping,
+)
 
 __all__ = [
     "ArticulationSpec",
@@ -9,4 +15,8 @@ __all__ = [
     "OpenEpisodeAudit",
     "OpenEpisodeContract",
     "OpenEpisodeSample",
+    "RealApplianceUsdManifest",
+    "UsdJointDescriptor",
+    "choose_open_joint_candidates",
+    "descriptor_from_mapping",
 ]
