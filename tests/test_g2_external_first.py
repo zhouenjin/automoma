@@ -26,6 +26,7 @@ from automoma.integrations.realappliance.g2_adapter import (
     make_g2_curobo_config,
 )
 from automoma.integrations.realappliance.g2_runtime import (
+    akr_parameter_for_articulation_progress,
     adaptive_interaction_lead_limit_m,
     gripper_targets,
     planar_tracking_twist,
@@ -383,6 +384,18 @@ def test_physical_search_expands_automatic_candidate_and_path_order(tmp_path):
         ("rank0", 0),
         ("rank1", 0),
     ]
+
+
+def test_akr_rebase_parameter_handles_direction_and_nonuniform_progress():
+    assert akr_parameter_for_articulation_progress(
+        [0.0, -0.1, -0.4, -0.8], planning_fraction=0.8, measured_progress_fraction=0.3
+    ) == pytest.approx(5.0 / 9.0)
+    assert akr_parameter_for_articulation_progress(
+        [0.0, 0.3, 0.29, 0.8], planning_fraction=0.8, measured_progress_fraction=0.4
+    ) == pytest.approx(11.0 / 15.0)
+    assert akr_parameter_for_articulation_progress(
+        [0.0, 0.2, 0.8], planning_fraction=0.8, measured_progress_fraction=2.0
+    ) == pytest.approx(1.0)
 
 
 def test_g2_runtime_maps_planar_twist_to_four_swerve_modules():

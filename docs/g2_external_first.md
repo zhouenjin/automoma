@@ -162,8 +162,8 @@ first over hypotheses: the best path of every learned contact/hand hypothesis
 is tested before any hypothesis consumes budget on its second-best path. The
 exact launch command, hypothesis metadata, result path, progress, and failure
 reasons are persisted before and after every Isaac invocation. A process guard
-stops the search if the separate G2 pipeline occupies Isaac; it never kills or
-preempts that work.
+either stops immediately or waits with an explicit timeout when the separate
+G2 pipeline occupies Isaac; it never kills or preempts that work.
 
 For the first 055 pool, the top five learned contacts combined with both hands
 gave 10/10 collision-valid planning hypotheses and 52 physical path trials.

@@ -177,6 +177,45 @@ def adaptive_interaction_lead_limit_m(
     return float(limit), fraction
 
 
+def akr_parameter_for_articulation_progress(
+    akr_positions: Sequence[float],
+    *,
+    planning_fraction: float,
+    measured_progress_fraction: float,
+) -> float:
+    """Map live articulation progress back onto a possibly nonuniform AKR path.
+
+    The AKR joint can increase or decrease and may contain small optimizer
+    reversals.  Projecting it into normalized articulation progress and taking
+    a cumulative maximum makes the inverse mapping deterministic without
+    assuming uniform trajectory timing.
+    """
+
+    positions = np.asarray(akr_positions, dtype=np.float64).reshape(-1)
+    if positions.size < 2 or not np.all(np.isfinite(positions)):
+        raise ValueError("akr_positions must contain at least two finite values")
+    if not math.isfinite(planning_fraction) or not 0.0 < planning_fraction <= 1.0:
+        raise ValueError("planning_fraction must be finite and in (0, 1]")
+    if not math.isfinite(measured_progress_fraction):
+        raise ValueError("measured_progress_fraction must be finite")
+    delta = float(positions[-1] - positions[0])
+    if abs(delta) <= 1.0e-12:
+        raise ValueError("AKR path has no articulation displacement")
+
+    normalized_path = np.maximum.accumulate((positions - positions[0]) / delta)
+    normalized_path = np.clip(normalized_path, 0.0, 1.0)
+    target = float(np.clip(measured_progress_fraction / planning_fraction, 0.0, 1.0))
+    upper = int(np.searchsorted(normalized_path, target, side="left"))
+    if upper <= 0:
+        return 0.0
+    if upper >= positions.size:
+        return 1.0
+    lower = upper - 1
+    span = float(normalized_path[upper] - normalized_path[lower])
+    local = 0.0 if span <= 1.0e-12 else (target - float(normalized_path[lower])) / span
+    return float((lower + local) / (positions.size - 1))
+
+
 def yaw_from_quaternion_wxyz(quaternion: Sequence[float]) -> float:
     w, x, y, z = np.asarray(quaternion, dtype=np.float64).reshape(4)
     return float(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
