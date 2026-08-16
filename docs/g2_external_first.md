@@ -196,6 +196,41 @@ contact window when the reference cannot advance without contact; waiting the
 old eight-second stall budget could not create contact because AKR progression
 is contact-gated.
 
+A 60-second replay of the automatically selected rank-one left path reached
+52.140% opening. It accumulated 2,537 selected-contact steps (1,306 bilateral),
+remained free of off-selected contact until the late slip, and used 84.2% of
+the adaptive lead probe. After the fingers left the handle, the passive door
+continued under its own dynamics, while body-joint tracking error grew to
+1.011 rad. This is still below the 70% revolute acceptance threshold and is
+recorded as a failure, not promoted by its visually substantial partial open.
+
+The first contact-loss recovery experiment exposed an unsafe recovery design.
+After 0.1 seconds without selected contact, it opened the gripper to 30% and
+continuously remapped the old AKR path to the live articulation. The transient
+was detected at 19.673%; while the passive door returned toward closed, the
+controller chased the regressing reference to zero progress. Neither of two
+regrasp attempts recovered contact, body-joint tracking error reached 1.654
+rad, peak contact force reached 384.443 N, and maximum opening was only
+20.333%. That policy was rejected.
+
+The replacement is a progress-preserving local reclose rather than a global
+path chase:
+
+- contact loss is debounced for 0.2 seconds;
+- the measured robot joints and planar base pose are frozen for 0.2 seconds,
+  allowing transient contact to return without moving the arm;
+- if necessary, the gripper unloads only to 90%, holds locally for 0.2 seconds,
+  and recloses over 0.4 seconds;
+- the process is bounded to two attempts and aborts if articulation rolls back
+  by more than five percentage points;
+- only after stable measured handle contact is recovered is AKR progress
+  remapped to the live articulation and normal path following resumed.
+
+These values are controller-wide safety limits, not asset-specific offsets.
+The local-reclose policy remains experimental until a fresh PhysX replay
+confirms that it both avoids the rejected high-force regression and recovers
+real handle contact.
+
 Results before the complete home-to-contact and release/retreat phases remain
 `dataset_ready=false` even if they pass the physical opening threshold.
 

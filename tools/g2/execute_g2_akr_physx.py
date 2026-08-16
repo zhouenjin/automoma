@@ -49,12 +49,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-epsilon-fraction", type=float, default=0.0005)
     parser.add_argument("--initial-contact-acquisition-seconds", type=float, default=1.0)
     parser.add_argument("--maximum-regrasp-attempts", type=int, default=2)
-    parser.add_argument("--contact-loss-seconds", type=float, default=0.10)
-    parser.add_argument("--regrasp-open-fraction", type=float, default=0.30)
-    parser.add_argument("--regrasp-open-seconds", type=float, default=0.30)
-    parser.add_argument("--regrasp-reposition-seconds", type=float, default=2.0)
-    parser.add_argument("--regrasp-close-seconds", type=float, default=1.5)
+    parser.add_argument("--contact-loss-seconds", type=float, default=0.20)
+    parser.add_argument("--regrasp-freeze-seconds", type=float, default=0.20)
+    parser.add_argument("--regrasp-open-fraction", type=float, default=0.90)
+    parser.add_argument("--regrasp-open-seconds", type=float, default=0.10)
+    parser.add_argument("--regrasp-reposition-seconds", type=float, default=0.20)
+    parser.add_argument("--regrasp-close-seconds", type=float, default=0.40)
     parser.add_argument("--regrasp-stable-contact-seconds", type=float, default=0.10)
+    parser.add_argument("--regrasp-maximum-progress-rollback-fraction", type=float, default=0.05)
     parser.add_argument("--maximum-base-tracking-error-m", type=float, default=0.008)
     parser.add_argument("--maximum-contact-base-tracking-error-m", type=float, default=0.015)
     parser.add_argument("--maximum-base-yaw-error-rad", type=float, default=0.02)
@@ -85,8 +87,15 @@ if ARGS.contact_loss_seconds <= 0.0 or ARGS.regrasp_stable_contact_seconds <= 0.
     raise ValueError("contact loss and stable regrasp durations must be positive")
 if not 0.0 <= ARGS.regrasp_open_fraction < 1.0:
     raise ValueError("--regrasp-open-fraction must be in [0, 1)")
-if min(ARGS.regrasp_open_seconds, ARGS.regrasp_reposition_seconds, ARGS.regrasp_close_seconds) <= 0.0:
+if min(
+    ARGS.regrasp_freeze_seconds,
+    ARGS.regrasp_open_seconds,
+    ARGS.regrasp_reposition_seconds,
+    ARGS.regrasp_close_seconds,
+) <= 0.0:
     raise ValueError("regrasp phase durations must be positive")
+if not 0.0 <= ARGS.regrasp_maximum_progress_rollback_fraction <= 1.0:
+    raise ValueError("--regrasp-maximum-progress-rollback-fraction must be in [0, 1]")
 if not math.isfinite(ARGS.planner_effort_multiplier) or ARGS.planner_effort_multiplier <= 0.0:
     raise ValueError("--planner-effort-multiplier must be finite and positive")
 if not math.isfinite(ARGS.base_effort_multiplier) or ARGS.base_effort_multiplier <= 0.0:
@@ -726,26 +735,29 @@ def main() -> int:
     regrasp_stable_contact_steps = 0
     regrasp_trigger_progress_fractions: list[float] = []
     regrasp_recovery_progress_fractions: list[float] = []
+    regrasp_trigger_progress: float | None = None
+    regrasp_hold_robot_joints: np.ndarray | None = None
+    regrasp_hold_base: np.ndarray | None = None
     contact_loss_steps = max(1, int(math.ceil(ARGS.contact_loss_seconds * ARGS.physics_hz)))
+    regrasp_freeze_steps = max(1, int(math.ceil(ARGS.regrasp_freeze_seconds * ARGS.physics_hz)))
     regrasp_open_steps = max(1, int(math.ceil(ARGS.regrasp_open_seconds * ARGS.physics_hz)))
     regrasp_reposition_steps = max(1, int(math.ceil(ARGS.regrasp_reposition_seconds * ARGS.physics_hz)))
     regrasp_close_steps = max(1, int(math.ceil(ARGS.regrasp_close_seconds * ARGS.physics_hz)))
     stable_regrasp_steps = max(1, int(math.ceil(ARGS.regrasp_stable_contact_seconds * ARGS.physics_hz)))
     for opening_step in range(maximum_total_opening_steps):
-        if regrasp_phase is not None:
-            live_joint_position = float(_as_numpy(appliance.get_joint_positions()).reshape(-1)[target_index])
-            live_progress = _progress(task, live_joint_position)
-            reference_progress = akr_parameter_for_articulation_progress(
-                trajectory[:, -1],
-                planning_fraction=float(task["planning_fraction"]),
-                measured_progress_fraction=live_progress,
-            )
         reference = _sample_trajectory(trajectory, reference_progress)
         position_raw, quaternion_raw = base_probe.get_world_pose()
         measured_base = np.asarray(
             (*_as_numpy(position_raw).reshape(3)[:2], yaw_from_quaternion_wxyz(quaternion_raw))
         )
-        base_target = _aligned_base_target(base_plan_start, measured_base_start, reference[:3])
+        if regrasp_phase is not None:
+            if regrasp_hold_base is None or regrasp_hold_robot_joints is None:
+                raise RuntimeError("regrasp hold state was not initialized")
+            base_target = regrasp_hold_base
+            planner_target = regrasp_hold_robot_joints
+        else:
+            base_target = _aligned_base_target(base_plan_start, measured_base_start, reference[:3])
+            planner_target = reference[3:-1]
         twist, base_error, yaw_error = planar_tracking_twist(
             measured_base,
             base_target,
@@ -760,9 +772,11 @@ def main() -> int:
         wheel *= max(0.0, math.cos(min(math.pi / 2.0, steering_error)))
         robot.set_joint_position_targets(steering.reshape(1, -1), joint_indices=steering_indices)
         robot.set_joint_velocity_targets(wheel.reshape(1, -1), joint_indices=wheel_indices)
-        robot.set_joint_position_targets(reference[3:-1].reshape(1, -1), joint_indices=planner_indices)
+        robot.set_joint_position_targets(planner_target.reshape(1, -1), joint_indices=planner_indices)
         gripper_fraction = 1.0
-        if regrasp_phase == "open":
+        if regrasp_phase == "freeze":
+            phase = "regrasp_freeze"
+        elif regrasp_phase == "open":
             local_fraction = min(1.0, (regrasp_phase_step + 1) / regrasp_open_steps)
             gripper_fraction = 1.0 + local_fraction * (ARGS.regrasp_open_fraction - 1.0)
             phase = "regrasp_open"
@@ -821,7 +835,7 @@ def main() -> int:
         if selected_contact_now:
             maximum_contact_interaction_lead = max(maximum_contact_interaction_lead, interaction_lead_m)
         measured_robot_joints = _as_numpy(robot.get_joint_positions(joint_indices=planner_indices)).reshape(-1)
-        robot_joint_errors = np.abs(measured_robot_joints - reference[3:-1])
+        robot_joint_errors = np.abs(measured_robot_joints - planner_target)
         worst_robot_joint_index = int(np.argmax(robot_joint_errors))
         robot_joint_error = float(robot_joint_errors[worst_robot_joint_index])
         worst_robot_joint_name = planner_names[worst_robot_joint_index]
@@ -891,7 +905,44 @@ def main() -> int:
         )
         if regrasp_phase is not None:
             regrasp_phase_step += 1
-            if regrasp_phase == "open" and regrasp_phase_step >= regrasp_open_steps:
+            if (
+                regrasp_trigger_progress is not None
+                and measured_progress
+                < regrasp_trigger_progress - ARGS.regrasp_maximum_progress_rollback_fraction
+            ):
+                opening_termination = "regrasp_progress_rollback_exceeded"
+                last_blocking_gates = ["articulation_progress_rollback"]
+                break
+            if regrasp_phase in {"freeze", "close"}:
+                if selected_contact_now:
+                    regrasp_stable_contact_steps += 1
+                else:
+                    regrasp_stable_contact_steps = 0
+            if regrasp_stable_contact_steps >= stable_regrasp_steps:
+                regrasp_recoveries += 1
+                regrasp_recovery_progress_fractions.append(measured_progress)
+                reference_progress = akr_parameter_for_articulation_progress(
+                    trajectory[:, -1],
+                    planning_fraction=float(task["planning_fraction"]),
+                    measured_progress_fraction=measured_progress,
+                )
+                regrasp_phase = None
+                regrasp_phase_step = 0
+                regrasp_stable_contact_steps = 0
+                regrasp_trigger_progress = None
+                regrasp_hold_robot_joints = None
+                regrasp_hold_base = None
+                selected_contact_seen = True
+                selected_contact_missing_steps = 0
+                stalled_steps = 0
+                no_object_progress_steps = 0
+                best_opening_progress = max(best_opening_progress, measured_progress)
+                continue
+            if regrasp_phase == "freeze" and regrasp_phase_step >= regrasp_freeze_steps:
+                regrasp_phase = "open"
+                regrasp_phase_step = 0
+                regrasp_stable_contact_steps = 0
+            elif regrasp_phase == "open" and regrasp_phase_step >= regrasp_open_steps:
                 regrasp_phase = "reposition"
                 regrasp_phase_step = 0
                 regrasp_stable_contact_steps = 0
@@ -899,27 +950,12 @@ def main() -> int:
                 regrasp_phase = "close"
                 regrasp_phase_step = 0
                 regrasp_stable_contact_steps = 0
-            elif regrasp_phase == "close":
-                if selected_contact_now:
-                    regrasp_stable_contact_steps += 1
-                else:
-                    regrasp_stable_contact_steps = 0
-                if regrasp_stable_contact_steps >= stable_regrasp_steps:
-                    regrasp_recoveries += 1
-                    regrasp_recovery_progress_fractions.append(measured_progress)
-                    regrasp_phase = None
-                    regrasp_phase_step = 0
-                    regrasp_stable_contact_steps = 0
-                    selected_contact_seen = True
-                    selected_contact_missing_steps = 0
-                    stalled_steps = 0
-                    no_object_progress_steps = 0
-                    best_opening_progress = max(best_opening_progress, measured_progress)
-                elif regrasp_phase_step >= regrasp_close_steps:
+            elif regrasp_phase == "close" and regrasp_phase_step >= regrasp_close_steps:
+                if regrasp_stable_contact_steps < stable_regrasp_steps:
                     if regrasp_attempts < ARGS.maximum_regrasp_attempts:
                         regrasp_attempts += 1
                         regrasp_trigger_progress_fractions.append(measured_progress)
-                        regrasp_phase = "open"
+                        regrasp_phase = "freeze"
                         regrasp_phase_step = 0
                         regrasp_stable_contact_steps = 0
                     else:
@@ -932,7 +968,10 @@ def main() -> int:
             if regrasp_attempts < ARGS.maximum_regrasp_attempts:
                 regrasp_attempts += 1
                 regrasp_trigger_progress_fractions.append(measured_progress)
-                regrasp_phase = "open"
+                regrasp_trigger_progress = measured_progress
+                regrasp_hold_robot_joints = measured_robot_joints.copy()
+                regrasp_hold_base = measured_base.copy()
+                regrasp_phase = "freeze"
                 regrasp_phase_step = 0
                 regrasp_stable_contact_steps = 0
                 stalled_steps = 0
@@ -1004,11 +1043,13 @@ def main() -> int:
                 "attempts": regrasp_attempts,
                 "recoveries": regrasp_recoveries,
                 "contact_loss_seconds": ARGS.contact_loss_seconds,
+                "freeze_seconds": ARGS.regrasp_freeze_seconds,
                 "open_fraction": ARGS.regrasp_open_fraction,
                 "open_seconds": ARGS.regrasp_open_seconds,
                 "reposition_seconds": ARGS.regrasp_reposition_seconds,
                 "close_seconds": ARGS.regrasp_close_seconds,
                 "stable_contact_seconds": ARGS.regrasp_stable_contact_seconds,
+                "maximum_progress_rollback_fraction": ARGS.regrasp_maximum_progress_rollback_fraction,
                 "trigger_progress_fractions": regrasp_trigger_progress_fractions,
                 "recovery_progress_fractions": regrasp_recovery_progress_fractions,
             },
