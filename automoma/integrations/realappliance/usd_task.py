@@ -77,6 +77,38 @@ class ExtractedUsdTask:
             joint_at_initial_to_object_root=matrix_to_transform_rpy(invert_rigid(world_from_joint) @ world_from_root),
         )
 
+    def placed(self, world_from_source: Sequence[Sequence[float]]) -> "ExtractedUsdTask":
+        """Place the source asset in a world frame without changing its articulation."""
+
+        placement = np.asarray(world_from_source, dtype=np.float64)
+        source_from_joint = np.asarray(self.world_from_joint_at_initial, dtype=np.float64)
+        source_from_target = np.asarray(self.world_from_target_link_at_initial, dtype=np.float64)
+        source_from_root = np.asarray(self.world_from_object_root, dtype=np.float64)
+        task = ArticulationTaskSpec(
+            joint_name=self.task.joint_name,
+            target_link=self.task.target_link,
+            handle_link=self.task.handle_link,
+            joint_kind=self.task.joint_kind,
+            axis=transform_vector(placement, self.task.axis),
+            pivot=transform_point(placement, self.task.pivot),
+            lower_limit=self.task.lower_limit,
+            upper_limit=self.task.upper_limit,
+            initial_position=self.task.initial_position,
+        )
+        return ExtractedUsdTask(
+            task_name=self.task_name,
+            semantic_label=self.semantic_label,
+            annotated_part=self.annotated_part,
+            joint_path=self.joint_path,
+            body0_path=self.body0_path,
+            body1_path=self.body1_path,
+            task=task,
+            joint_axis_local=self.joint_axis_local,
+            world_from_joint_at_initial=freeze_matrix(placement @ source_from_joint),
+            world_from_target_link_at_initial=freeze_matrix(placement @ source_from_target),
+            world_from_object_root=freeze_matrix(placement @ source_from_root),
+        )
+
 
 def resolve_annotated_parts(annotations: Mapping[str, str], task_name: str) -> Tuple[Tuple[str, str], ...]:
     """Return every semantically compatible part, preserving annotation order."""

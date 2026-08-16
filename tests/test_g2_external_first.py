@@ -12,6 +12,7 @@ from automoma.integrations.realappliance.akr_adapter import (
     make_g2_akr_config,
 )
 from automoma.integrations.realappliance.contracts import ArticulationTaskSpec, JointKind, PhysicsRunPolicy
+from automoma.integrations.realappliance.contact_candidates import ContactCandidate
 from automoma.integrations.realappliance.g2_adapter import (
     Bounds3D,
     Hand,
@@ -21,8 +22,10 @@ from automoma.integrations.realappliance.g2_adapter import (
 )
 from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
 from automoma.integrations.realappliance.transform_math import (
+    axis_motion_transform,
     matrix_to_transform_rpy,
     quaternion_transform,
+    rotation_matrix_to_quaternion_wxyz,
     transform_rpy_to_matrix,
 )
 from automoma.integrations.realappliance.usd_task import ExtractedUsdTask, resolve_annotated_parts
@@ -182,6 +185,45 @@ def test_rpy_round_trip_preserves_rigid_transform():
     source = quaternion_transform((0.2, -0.4, 0.7), (0.91, 0.1, -0.25, 0.3))
     encoded = matrix_to_transform_rpy(source)
     assert np.allclose(transform_rpy_to_matrix(encoded), source, atol=1e-8)
+
+
+def test_contact_candidate_placement_aligns_geometry_without_asset_rules():
+    candidate = ContactCandidate(
+        hypothesis_id="candidate",
+        source_usd="Aligned.usd",
+        target_joint_path="/World/part/joint",
+        contact_center_source=(0.1, -0.2, 0.3),
+        contact_points_source=((0.09, -0.2, 0.3), (0.11, -0.2, 0.3)),
+        approach_source=(0.0, 1.0, 0.0),
+        closing_source=(1.0, 0.0, 0.0),
+        gripper_y_source=(0.0, 0.0, -1.0),
+        handle_approach_depth=0.04,
+        gripper_width=0.02,
+        pre_ik_score=1.0,
+        automatic_rank=0,
+    )
+    placed = candidate.place(
+        handle_anchor_world=(0.8, 0.0, 1.2),
+        desired_approach_world=(1.0, 0.0, 0.0),
+        capture_depth_fraction=0.25,
+    )
+    source = np.asarray(placed.world_from_source)
+    ee = np.asarray(placed.world_from_ee_contact)
+    precontact = np.asarray(placed.world_from_ee_precontact)
+    assert np.allclose(source @ np.asarray([0.1, -0.2, 0.3, 1.0]), (0.8, 0.0, 1.2, 1.0))
+    assert np.allclose(ee[:3, 2], (1.0, 0.0, 0.0), atol=1e-8)
+    assert np.allclose(ee[:3, 3], (0.79, 0.0, 1.2), atol=1e-8)
+    assert np.allclose(precontact[:3, 3], (0.67, 0.0, 1.2), atol=1e-8)
+
+
+def test_joint_motion_and_quaternion_helpers_agree():
+    angle = 0.7
+    motion = axis_motion_transform((0.0, 0.0, 1.0), angle, revolute=True)
+    quaternion = rotation_matrix_to_quaternion_wxyz(motion)
+    reconstructed = quaternion_transform((0.0, 0.0, 0.0), quaternion)
+    assert np.allclose(reconstructed, motion, atol=1e-8)
+    translation = axis_motion_transform((0.0, 2.0, 0.0), 0.4, revolute=False)
+    assert np.allclose(translation[:3, 3], (0.0, 0.4, 0.0))
 
 
 def test_extracted_task_builds_an_akr_chain_that_cancels_target_motion():

@@ -68,6 +68,97 @@ def transform_vector(matrix: Sequence[Sequence[float]], vector: Sequence[float])
     return tuple(float(value) for value in result)
 
 
+def axis_motion_transform(axis: Sequence[float], displacement: float, *, revolute: bool) -> np.ndarray:
+    """Create a revolute or prismatic joint transform in the joint frame."""
+
+    direction = np.asarray(axis, dtype=np.float64)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-12:
+        raise ValueError("joint axis has zero length")
+    direction /= norm
+    result = np.eye(4, dtype=np.float64)
+    if not revolute:
+        result[:3, 3] = direction * float(displacement)
+        return result
+    x, y, z = direction
+    cosine = math.cos(displacement)
+    sine = math.sin(displacement)
+    one_minus_cosine = 1.0 - cosine
+    result[:3, :3] = np.asarray(
+        [
+            [
+                cosine + x * x * one_minus_cosine,
+                x * y * one_minus_cosine - z * sine,
+                x * z * one_minus_cosine + y * sine,
+            ],
+            [
+                y * x * one_minus_cosine + z * sine,
+                cosine + y * y * one_minus_cosine,
+                y * z * one_minus_cosine - x * sine,
+            ],
+            [
+                z * x * one_minus_cosine - y * sine,
+                z * y * one_minus_cosine + x * sine,
+                cosine + z * z * one_minus_cosine,
+            ],
+        ],
+        dtype=np.float64,
+    )
+    return result
+
+
+def rotation_matrix_to_quaternion_wxyz(matrix: Sequence[Sequence[float]]) -> Tuple[float, float, float, float]:
+    """Convert a rotation or homogeneous matrix to a normalized WXYZ quaternion."""
+
+    array = np.asarray(matrix, dtype=np.float64)
+    rotation = array[:3, :3] if array.shape == (4, 4) else array
+    if rotation.shape != (3, 3):
+        raise ValueError(f"expected a 3x3 or 4x4 matrix, got {array.shape}")
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5):
+        raise ValueError("rotation is not orthonormal")
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quaternion = (
+            0.25 * scale,
+            (rotation[2, 1] - rotation[1, 2]) / scale,
+            (rotation[0, 2] - rotation[2, 0]) / scale,
+            (rotation[1, 0] - rotation[0, 1]) / scale,
+        )
+    else:
+        diagonal = np.diag(rotation)
+        index = int(np.argmax(diagonal))
+        if index == 0:
+            scale = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2.0
+            quaternion = (
+                (rotation[2, 1] - rotation[1, 2]) / scale,
+                0.25 * scale,
+                (rotation[0, 1] + rotation[1, 0]) / scale,
+                (rotation[0, 2] + rotation[2, 0]) / scale,
+            )
+        elif index == 1:
+            scale = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2.0
+            quaternion = (
+                (rotation[0, 2] - rotation[2, 0]) / scale,
+                (rotation[0, 1] + rotation[1, 0]) / scale,
+                0.25 * scale,
+                (rotation[1, 2] + rotation[2, 1]) / scale,
+            )
+        else:
+            scale = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2.0
+            quaternion = (
+                (rotation[1, 0] - rotation[0, 1]) / scale,
+                (rotation[0, 2] + rotation[2, 0]) / scale,
+                (rotation[1, 2] + rotation[2, 1]) / scale,
+                0.25 * scale,
+            )
+    quaternion_array = np.asarray(quaternion, dtype=np.float64)
+    quaternion_array /= np.linalg.norm(quaternion_array)
+    if quaternion_array[0] < 0.0:
+        quaternion_array *= -1.0
+    return tuple(float(value) for value in quaternion_array)
+
+
 def quaternion_transform(position: Sequence[float], quaternion_wxyz: Sequence[float]) -> np.ndarray:
     """Build a homogeneous transform from translation and a WXYZ quaternion."""
 
