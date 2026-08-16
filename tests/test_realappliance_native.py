@@ -6,7 +6,9 @@ from automoma.integrations.realappliance_native import (
     OpenEpisodeContract,
     OpenEpisodeSample,
 )
-from automoma.integrations.realappliance_native.contracts import require_robot_only_action
+from automoma.integrations.realappliance_native.contracts import (
+    require_robot_only_action,
+)
 
 
 def test_revolute_contact_follows_the_door_arc() -> None:
@@ -35,7 +37,9 @@ def test_strict_contract_rejects_object_commands_even_when_open() -> None:
     audit = contract.evaluate(
         [
             OpenEpisodeSample(0.0, robot_target_contact=True),
-            OpenEpisodeSample(0.8, robot_target_contact=True, object_target_was_written=True),
+            OpenEpisodeSample(
+                0.8, robot_target_contact=True, object_target_was_written=True
+            ),
         ]
     )
 

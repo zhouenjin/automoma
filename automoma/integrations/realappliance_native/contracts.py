@@ -77,7 +77,9 @@ class OpenEpisodeContract:
         if not trace:
             return OpenEpisodeAudit(False, 0.0, 0.0, 0, ("empty_trace",))
 
-        fractions = tuple(self.range_fraction(sample.target_joint_position) for sample in trace)
+        fractions = tuple(
+            self.range_fraction(sample.target_joint_position) for sample in trace
+        )
         contact_steps = sum(sample.robot_target_contact for sample in trace)
         failure_reasons: list[str] = []
 
@@ -85,7 +87,10 @@ class OpenEpisodeContract:
             failure_reasons.append("target_joint_commanded")
         if any(sample.attachment_active for sample in trace):
             failure_reasons.append("attachment_used")
-        if any(sample.maximum_penetration_m > self.maximum_allowed_penetration_m for sample in trace):
+        if any(
+            sample.maximum_penetration_m > self.maximum_allowed_penetration_m
+            for sample in trace
+        ):
             failure_reasons.append("penetration_limit_exceeded")
         if contact_steps < self.minimum_contact_steps:
             failure_reasons.append("insufficient_robot_target_contact")

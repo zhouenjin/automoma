@@ -8,7 +8,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-def _vector(value: np.ndarray | list[float] | tuple[float, ...], *, size: int) -> np.ndarray:
+def _vector(
+    value: np.ndarray | list[float] | tuple[float, ...], *, size: int
+) -> np.ndarray:
     array = np.asarray(value, dtype=np.float64)
     if array.shape != (size,):
         raise ValueError(f"expected shape {(size,)}, got {array.shape}")
@@ -49,7 +51,11 @@ class JointConditionedContactPath:
     contact_orientation_wxyz: np.ndarray
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "contact_position_world_m", _vector(self.contact_position_world_m, size=3))
+        object.__setattr__(
+            self,
+            "contact_position_world_m",
+            _vector(self.contact_position_world_m, size=3),
+        )
         quaternion = _vector(self.contact_orientation_wxyz, size=4)
         norm = float(np.linalg.norm(quaternion))
         if norm <= 1.0e-9:
@@ -59,7 +65,9 @@ class JointConditionedContactPath:
     def pose(self, joint_position: float) -> tuple[np.ndarray, np.ndarray]:
         delta = float(joint_position - self.articulation.initial_position)
         if self.articulation.joint_type == "prismatic":
-            position = self.contact_position_world_m + self.articulation.axis_world * delta
+            position = (
+                self.contact_position_world_m + self.articulation.axis_world * delta
+            )
             return position, self.contact_orientation_wxyz.copy()
 
         rotation = Rotation.from_rotvec(self.articulation.axis_world * delta)
@@ -73,8 +81,6 @@ class JointConditionedContactPath:
         if steps < 2:
             raise ValueError("steps must be at least two")
         values = np.linspace(
-            self.articulation.initial_position,
-            self.articulation.goal_position,
-            steps,
+            self.articulation.initial_position, self.articulation.goal_position, steps,
         )
         return tuple((float(value), *self.pose(float(value))) for value in values)
