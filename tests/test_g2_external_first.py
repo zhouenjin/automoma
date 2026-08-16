@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import xml.etree.ElementTree as ET
+
+import pytest
+
+from automoma.integrations.realappliance.contracts import ArticulationTaskSpec, JointKind, PhysicsRunPolicy
+from automoma.integrations.realappliance.g2_adapter import Hand, build_planar_g2_urdf, make_g2_curobo_config
+from automoma.integrations.realappliance.hypotheses import generate_interaction_hypotheses
+
+
+MINIMAL_G2 = """<?xml version="1.0"?>
+<robot name="g2">
+  <link name="base_link"/>
+  <link name="body_link"/>
+  <link name="left_gripper_center"/>
+  <link name="right_gripper_center"/>
+  <joint name="body_joint" type="revolute">
+    <parent link="base_link"/><child link="body_link"/>
+    <axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+  <joint name="left_ee" type="fixed"><parent link="body_link"/><child link="left_gripper_center"/></joint>
+  <joint name="right_ee" type="fixed"><parent link="body_link"/><child link="right_gripper_center"/></joint>
+</robot>
+"""
+
+
+def test_planar_g2_urdf_adds_three_base_dofs(tmp_path):
+    source = tmp_path / "g2.urdf"
+    output = tmp_path / "g2_planar.urdf"
+    source.write_text(MINIMAL_G2, encoding="utf-8")
+
+    build_planar_g2_urdf(source, output)
+    root = ET.parse(output).getroot()
+    joints = {joint.attrib["name"]: joint for joint in root.findall("joint")}
+
+    assert {"base_x", "base_y", "base_yaw", "automoma_g2_mount"}.issubset(joints)
+    assert joints["automoma_g2_mount"].find("child").attrib["link"] == "base_link"
+
+
+def test_curobo_config_enumerates_base_and_selected_hand(tmp_path):
+    source = {
+        "robot_cfg": {
+            "kinematics": {
+                "base_link": "base_link",
+                "ee_link": "right_gripper_center",
+                "cspace": {
+                    "joint_names": ["body_joint"],
+                    "retract_config": [0.0],
+                    "null_space_weight": [1.0],
+                    "cspace_distance_weight": [1.0],
+                    "max_acceleration": [2.0],
+                    "max_jerk": [20.0],
+                },
+            }
+        }
+    }
+    result = make_g2_curobo_config(source, tmp_path / "g2_planar.urdf", Hand.LEFT)
+    kin = result["robot_cfg"]["kinematics"]
+
+    assert kin["base_link"] == "automoma_world"
+    assert kin["ee_link"] == "left_gripper_center"
+    assert kin["cspace"]["joint_names"] == ["base_x", "base_y", "base_yaw", "body_joint"]
+    assert len(kin["cspace"]["retract_config"]) == 4
+
+
+def test_hypothesis_pool_contains_both_hands_without_asset_rules():
+    hypotheses = generate_interaction_hypotheses((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), [2, 7])
+    assert {hypothesis.hand for hypothesis in hypotheses} == {Hand.LEFT, Hand.RIGHT}
+    assert {hypothesis.grasp_index for hypothesis in hypotheses} == {2, 7}
+    assert len(hypotheses) == 2 * 27 * 2
+
+
+def test_physics_policy_rejects_object_joint_writes():
+    with pytest.raises(ValueError, match="write_target_joint"):
+        PhysicsRunPolicy(write_target_joint=True).validate()
+    PhysicsRunPolicy().validate()
+
+
+@pytest.mark.parametrize(
+    ("kind", "planning", "acceptance"), [(JointKind.REVOLUTE, 0.80, 0.70), (JointKind.PRISMATIC, 0.90, 0.80)],
+)
+def test_open_thresholds_are_task_conditioned(kind, planning, acceptance):
+    spec = ArticulationTaskSpec(
+        joint_name="joint",
+        target_link="door",
+        handle_link="handle",
+        joint_kind=kind,
+        axis=(0.0, 0.0, 1.0),
+        pivot=(0.0, 0.0, 0.0),
+        lower_limit=0.0,
+        upper_limit=1.0,
+        initial_position=0.0,
+    )
+    assert spec.planning_fraction == planning
+    assert spec.acceptance_fraction == acceptance
+    assert spec.position_at_fraction(planning) == pytest.approx(planning)

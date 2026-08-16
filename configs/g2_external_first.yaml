@@ -1,0 +1,24 @@
+integration:
+  name: g2_realappliance_external_first
+  task: open_handled
+  robot: g2_crsB_swiftpicker
+  hands: [left, right]
+  base:
+    planner_dofs: [base_x, base_y, base_yaw]
+    hard_front_fan: false
+    seed_standoffs: [0.45, 0.60, 0.75]
+    seed_lateral_offsets: [-0.20, 0.0, 0.20]
+    seed_yaw_offsets: [-0.20, 0.0, 0.20]
+  success:
+    revolute_plan_fraction: 0.80
+    revolute_accept_fraction: 0.70
+    prismatic_plan_fraction: 0.90
+    prismatic_accept_fraction: 0.80
+  physics:
+    set_object_state_during_episode: false
+    disable_target_collision: false
+    create_attachment: false
+    write_target_joint: false
+    require_measured_contact: true
+    require_penetration_audit: true
+

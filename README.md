@@ -68,6 +68,10 @@ Whole-body mobile manipulation requires robots to coordinate mobile base and arm
 
 For the detailed local handoff from asset preparation through planning, recording, conversion, training, and evaluation, see [`docs/pipeline.md`](docs/pipeline.md).
 
+The independent G2 + RealAppliance external-first port is documented in
+[`docs/g2_external_first.md`](docs/g2_external_first.md). It does not modify or
+depend on the legacy G2 controller repository.
+
 ## Installation
 
 ### Prerequisites
