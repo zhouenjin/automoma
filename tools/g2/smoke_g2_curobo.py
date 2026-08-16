@@ -41,7 +41,6 @@ def _load_config(path: Path):
 
 
 def _solve_ik(config, target_offset: float):
-    from curobo.geom.types import WorldConfig
     from curobo.types.base import TensorDeviceType
     from curobo.types.math import Pose
     from curobo.types.robot import RobotConfig
@@ -51,7 +50,7 @@ def _solve_ik(config, target_offset: float):
     robot_config = RobotConfig.from_dict(config["robot_cfg"], tensor_args)
     solver_config = IKSolverConfig.load_from_robot_config(
         robot_config,
-        WorldConfig(),
+        None,
         tensor_args,
         num_seeds=64,
         use_cuda_graph=False,
