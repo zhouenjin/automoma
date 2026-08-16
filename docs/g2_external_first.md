@@ -85,6 +85,58 @@ joint has the opposite displacement. A unit test checks the actual transform
 invariant over several door angles; merely loading the generated URDF is not
 treated as sufficient evidence.
 
+## Collision-aware AKR planning status
+
+The diagnostic planner now consumes the existing learned grasp-candidate pool,
+places the complete appliance collision geometry in its authored world pose,
+removes only the moving target cluster from the fixed planning world, and
+optimizes both hands and SE(2) base motion. Candidate rank is output metadata,
+not a required runtime input. Among valid trajectories, selection minimizes a
+single weighted cspace arc-length objective; the base is a soft global cost and
+has no fixed movement share.
+
+The same code found valid collision-aware plans for assets 020, 038, 039, and
+055. Both hands failed collision checking for 057, which is retained as a hard
+failure case rather than receiving an asset-specific exception. These are only
+kinematic planning results and must not be reported as physical success.
+
+## Physical execution status
+
+`tools/g2/execute_g2_akr_physx.py` independently executes the selected AKR path
+with G2 joint drives and the four physical swerve modules. It starts at the
+selected contact pose for this gate, closes the real SwiftPicker mechanism, and
+leaves the appliance articulation passive throughout. The target joint is not
+written, no attachment is created, and target collisions remain enabled.
+
+Contact success is measured near the selected learned handle surface after
+transforming its points with the live moving body. Contact elsewhere on the
+door is logged separately and cannot satisfy the grasp contract. High friction
+is applied to the fingers; when a handle is not a separate rigid body, it is
+not applied to the complete door. All three cameras use twice the original
+stand-off distance.
+
+The first auditable 055 execution reached 18.423% physical opening with
+selected-surface contact, 7.798 N maximum force, 0.140 mm maximum penetration,
+and zero off-selected-surface force. It then lost contact because the original
+fraction-based progress gate let the planned contact point lead the physical
+door by roughly 4--5 cm. A metric-gated run limited this lead to 3 mm and kept
+bilateral contact, but stalled at 1.147% because 3 mm preload did not overcome
+static friction and the 5 mm base tracking gate was marginally too tight.
+
+The current controller therefore uses a contact-conditioned, metric probe:
+
+- ordinary planned-contact lead is at most 3 mm;
+- after 0.5 s with selected contact and no measurable articulation progress,
+  the limit ramps continuously over 1.0 s to at most 15 mm;
+- any target progress or contact loss immediately resets the probe;
+- base tracking tolerance is 8 mm, while yaw and manipulator tracking remain
+  independently gated.
+
+This probe is a global static-friction mechanism, not an asset rule. Its first
+055 physics validation is pending. Results before the complete home-to-contact
+and release/retreat phases remain `dataset_ready=false` even if they pass the
+physical opening threshold.
+
 ## Gates
 
 1. Build and validate left/right G2 planner configs with three virtual base DOFs.
