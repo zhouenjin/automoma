@@ -27,8 +27,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs=7,
         metavar=("X", "Y", "Z", "QW", "QX", "QY", "QZ"),
-        required=True,
     )
+    parser.add_argument("--candidate-json", type=Path)
+    parser.add_argument("--candidate-rank", type=int, default=0)
     parser.add_argument("--source-initial-position", type=float, default=0.0)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -46,6 +47,20 @@ def main() -> None:
         raise RuntimeError("no matching open-joint component")
     component = components[0]
 
+    component_to_ee_pose = args.component_to_ee_pose
+    candidate_record = None
+    if args.candidate_json is not None:
+        candidates = json.loads(args.candidate_json.read_text(encoding="utf-8"))[
+            "candidates"
+        ]
+        matches = [value for value in candidates if int(value["rank"]) == args.candidate_rank]
+        if not matches:
+            raise RuntimeError(f"candidate rank {args.candidate_rank} not found")
+        candidate_record = matches[0]
+        component_to_ee_pose = candidate_record["component_to_gripper_base_pose"]
+    if component_to_ee_pose is None:
+        raise RuntimeError("pass --component-to-ee-pose or --candidate-json")
+
     base = yaml.safe_load(args.base_robot_config.read_text(encoding="utf-8"))
     sphere_config = yaml.safe_load(args.base_spheres.read_text(encoding="utf-8"))
     base["robot_cfg"]["kinematics"]["collision_spheres"] = sphere_config["collision_spheres"]
@@ -53,7 +68,7 @@ def main() -> None:
         base,
         manifest,
         component,
-        component_to_ee_pose=args.component_to_ee_pose,
+        component_to_ee_pose=component_to_ee_pose,
         source_initial_position=args.source_initial_position,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +86,10 @@ def main() -> None:
                     ]
                 ),
                 "g2_inputs_used": False,
+                "candidate_rank": args.candidate_rank if candidate_record else None,
+                "graspgen_confidence": (
+                    candidate_record["graspgen_confidence"] if candidate_record else None
+                ),
             }
         )
     )
